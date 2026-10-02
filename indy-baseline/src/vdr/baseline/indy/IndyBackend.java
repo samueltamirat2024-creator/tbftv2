@@ -110,6 +110,15 @@ public final class IndyBackend implements Backend {
     private final List<CompletableFuture<Void>> pendingFutures = new ArrayList<>();
     private final AtomicLong revocationIndex = new AtomicLong(1);
     private final AtomicLong entrySeq = new AtomicLong(1);
+    /** REVOC_REG_ENTRY transactions submitted to the pool (one per flushed batch). */
+    private final AtomicLong entriesSubmitted = new AtomicLong();
+    /**
+     * Ledger sequence numbers the pool returned for accepted REVOC_REG_ENTRY transactions. Distinct
+     * seqNos are the ledger's own count of what a burst cost, independent of how we batched.
+     */
+    private final java.util.Set<Long> entrySeqNos = ConcurrentHashMap.newKeySet();
+    private static final java.util.regex.Pattern SEQ_NO =
+            java.util.regex.Pattern.compile("\"seqNo\"\\s*:\\s*(\\d+)");
     /** The ledger's current accumulator for the registry; only the revoke chain touches it. */
     private volatile String previousAccumulator;
     /** Tail of the serial REVOC_REG_ENTRY chain. Never completes exceptionally. */
@@ -489,7 +498,15 @@ public final class IndyBackend implements Backend {
             batch.forEach(f -> f.completeExceptionally(e));
             return CompletableFuture.completedFuture(null);
         }
+        entriesSubmitted.incrementAndGet();
         return vdr.poolSubmitRequest(pool, req).handle((reply, err) -> {
+            if (err == null && reply != null) {
+                // txnMetadata.seqNo is the ledger position the pool assigned this entry.
+                java.util.regex.Matcher m = SEQ_NO.matcher(reply.replace("\\\"", "\""));
+                if (m.find()) {
+                    entrySeqNos.add(Long.parseLong(m.group(1)));
+                }
+            }
             if (err != null) {
                 // The local value may no longer match the ledger; the next entry re-reads it.
                 previousAccumulator = null;
@@ -500,6 +517,14 @@ public final class IndyBackend implements Backend {
             }
             return (Void) null;
         });
+    }
+
+    @Override public long revocationTransactionsSubmitted() {
+        return entriesSubmitted.get();
+    }
+
+    @Override public long revocationTransactionsConfirmed() {
+        return entrySeqNos.size();
     }
 
     @Override public void close() {

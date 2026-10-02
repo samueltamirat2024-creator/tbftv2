@@ -67,6 +67,24 @@ public interface Backend extends AutoCloseable {
     /** Flush any pending revocation batch. Called at the end of a run, never mid-window. */
     void flushRevocations();
 
+    /**
+     * Ordered revocation operations submitted so far: Tailored BFT gateway batches, Indy
+     * REVOC_REG_ENTRY transactions. With {@link #revocationTransactionsConfirmed} this shows how
+     * many consensus instances / ledger transactions a revoke burst actually cost, so the burst
+     * row cannot be read as a per-revocation cost when it is a per-batch one. -1 if unknown.
+     */
+    default long revocationTransactionsSubmitted() {
+        return -1;
+    }
+
+    /**
+     * Of those, how many the system acknowledged as committed: f+1 matching replies for the
+     * Tailored BFT VDR, a distinct ledger seqNo in the pool's reply for Indy. -1 if unknown.
+     */
+    default long revocationTransactionsConfirmed() {
+        return -1;
+    }
+
     @Override
     void close() throws Exception;
 }

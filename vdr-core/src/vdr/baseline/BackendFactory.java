@@ -32,6 +32,9 @@ public interface BackendFactory {
     /**
      * Reads {@code -Dvdr.backend}. Defaults to the Tailored BFT VDR.
      *
+     * <p>The Tailored BFT VDR reads {@code -Dvdr.maxBatchDelayMs} (default 50, matching Indy's
+     * {@code -Dindy.maxBatchDelayMs}).
+     *
      * <p>Indy additionally needs:
      * <ul>
      *   <li>{@code -Dindy.lib} — path to libindy_vdr (.so on Linux, .dylib on macOS)
@@ -54,7 +57,11 @@ public interface BackendFactory {
     static BackendFactory tailored() {
         return new BackendFactory() {
             @Override public Backend create(int n, int batchSize) {
-                return new TailoredBftBackend(n, batchSize, 20);
+                // Same default as Indy's -Dindy.maxBatchDelayMs. A shorter delay on one side lets
+                // its batches leave sooner and manufactures a latency gap; run-protocol.sh passes
+                // one value to both.
+                return new TailoredBftBackend(n, batchSize,
+                        Long.getLong("vdr.maxBatchDelayMs", 50L));
             }
 
             @Override public String displayName() {

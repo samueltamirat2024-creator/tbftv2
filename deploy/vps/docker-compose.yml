@@ -141,21 +141,25 @@ services:
   vdr-replica-0:
     <<: *vdr-replica
     command: ["./vdr-bftsmart/build.sh", "replica", "0", "/work/config"]
+    cpuset: "${REPLICA0_CPUSET:-}"     # node1's cores (cpu-plan.sh)
     networks: { vdrnet: { ipv4_address: 172.28.0.31, aliases: [vdr-replica-0] } }
 
   vdr-replica-1:
     <<: *vdr-replica
     command: ["./vdr-bftsmart/build.sh", "replica", "1", "/work/config"]
+    cpuset: "${REPLICA1_CPUSET:-}"     # node2's cores (cpu-plan.sh)
     networks: { vdrnet: { ipv4_address: 172.28.0.32, aliases: [vdr-replica-1] } }
 
   vdr-replica-2:
     <<: *vdr-replica
     command: ["./vdr-bftsmart/build.sh", "replica", "2", "/work/config"]
+    cpuset: "${REPLICA2_CPUSET:-}"     # node3's cores (cpu-plan.sh)
     networks: { vdrnet: { ipv4_address: 172.28.0.33, aliases: [vdr-replica-2] } }
 
   vdr-replica-3:
     <<: *vdr-replica
     command: ["./vdr-bftsmart/build.sh", "replica", "3", "/work/config"]
+    cpuset: "${REPLICA3_CPUSET:-}"     # node4's cores (cpu-plan.sh)
     networks: { vdrnet: { ipv4_address: 172.28.0.34, aliases: [vdr-replica-3] } }
 
   # The harness against the real cluster. Same generator, same metrics, same admission rule as
@@ -163,6 +167,9 @@ services:
   tailored-bft:
     <<: *bench
     profiles: [bftsmart]
+    # Load generator only, like indy-bench: same cap, same cores.
+    cpus: ${BENCH_CPUS:-4}
+    cpuset: "${AUX_CPUSET:-}"
     command: ["./artifact/run-all.sh", "${TAILORED_N:-4}", "${TAILORED_MODE:-full}"]
     environment:
       VDR_REPLICATION: bftsmart

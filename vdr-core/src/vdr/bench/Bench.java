@@ -94,6 +94,11 @@ public final class Bench {
         }
         System.out.println("=".repeat(94));
 
+        if (!EQUAL_LOAD_READ_HEAVY.isEmpty() || !EQUAL_LOAD_BURSTY.isEmpty()) {
+            runEqualLoad(n);
+            return;
+        }
+
         // Low levels are needed for Indy, whose writes go through a much slower consensus path.
         int[] levels = java.util.Arrays.stream(
                         System.getProperty("bench.levels", "10,20,50,100,250,500,1000,2000").split(","))
@@ -116,6 +121,49 @@ public final class Bench {
         writeResultsFile(List.of(readHeavy, bursty), n);
     }
 
+    /**
+     * Equal-offered-load mode. Comparing each system at its OWN operating point compares latencies
+     * at loads up to 40x apart; these lists fix the load instead, so both systems are measured at
+     * the same offered rate. Pick levels BOTH systems sustain: a level past either system's knee
+     * measures that system's queue. Either property switches the run to this mode (no sweep, no
+     * step-down; every listed level is measured with the full RUNS).
+     *
+     *   -Dbench.equalLoad.readHeavy=50,200 -Dbench.equalLoad.burstyRevoke=25,50
+     */
+    static final List<Integer> EQUAL_LOAD_READ_HEAVY = levelsProperty("bench.equalLoad.readHeavy");
+    static final List<Integer> EQUAL_LOAD_BURSTY = levelsProperty("bench.equalLoad.burstyRevoke");
+
+    static List<Integer> levelsProperty(String key) {
+        List<Integer> out = new ArrayList<>();
+        for (String s : System.getProperty(key, "").split(",")) {
+            if (!s.isBlank()) out.add(Integer.parseInt(s.trim()));
+        }
+        return out;
+    }
+
+    static void runEqualLoad(int n) throws Exception {
+        String label = BACKEND.displayName();
+        List<Result> results = new ArrayList<>();
+        for (Mix mix : new Mix[] {Mix.READ_HEAVY, Mix.BURSTY_REVOKE}) {
+            List<Integer> levels = mix == Mix.READ_HEAVY ? EQUAL_LOAD_READ_HEAVY : EQUAL_LOAD_BURSTY;
+            for (int rate : levels) {
+                System.out.printf("%n-- equal offered load: %s at %d ops/s%n", mix.label(), rate);
+                Result r = measure(label + " -- " + mix.label() + " @ " + rate + " ops/s", n, mix, rate);
+                // Not a reason to stop: the other system's row at this level is still wanted. But
+                // the row must say so, because its percentiles then describe a queue.
+                boolean keepsSchedule = r.throughput() >= 0.95 * rate;
+                boolean withinSlo = r.p99() <= P99_TARGET_US;
+                String verdict = keepsSchedule && withinSlo ? "sustained"
+                        : !keepsSchedule ? "SATURATED (throughput) -- not comparable"
+                        : "SATURATED (p99 past target) -- not comparable";
+                results.add(r.withNotes(verdict + "; " + r.notes()));
+            }
+        }
+        System.out.println();
+        printTable(results);
+        writeEqualLoadFile(results, n);
+    }
+
     /** Workload mixes of plan section 12.2 / Paper 2 section VIII-C. */
     enum Mix {
         READ_HEAVY(95, 4, 1, false),        // steady-state verification
@@ -128,13 +176,40 @@ public final class Bench {
         Mix(int r, int w, int rev, boolean burst) {
             this.resolvePct = r; this.writePct = w; this.revokePct = rev; this.burst = burst;
         }
+
+        /** "read-heavy", "bursty-revoke": the label compare.py keys rows by. */
+        String label() {
+            return name().toLowerCase().replace('_', '-');
+        }
     }
 
     /** Public so the gate suite can drive {@link #chooseLevel} directly (gate B2). */
+    /**
+     * @param burstTxns ordered revocation operations the burst cost, mean per run (-1 if the
+     *     backend cannot say)
+     * @param burstTxnsConfirmed of those, how many the system acknowledged, mean per run
+     */
     public record Result(String name, double throughput, double throughputCi,
                   double p50, double p95, double p99, String notes,
                   double resolveTput, double writeTput, double revokeTput,
-                  double burstDrainMs, double burstP99Us, int burstSize) {}
+                  double burstDrainMs, double burstP99Us, int burstSize,
+                  double burstTxns, double burstTxnsConfirmed) {
+
+        /** Without burst transaction counts (gate B2 builds rows this way). */
+        public Result(String name, double throughput, double throughputCi,
+                      double p50, double p95, double p99, String notes,
+                      double resolveTput, double writeTput, double revokeTput,
+                      double burstDrainMs, double burstP99Us, int burstSize) {
+            this(name, throughput, throughputCi, p50, p95, p99, notes, resolveTput, writeTput,
+                    revokeTput, burstDrainMs, burstP99Us, burstSize, -1, -1);
+        }
+
+        Result withNotes(String newNotes) {
+            return new Result(name, throughput, throughputCi, p50, p95, p99, newNotes,
+                    resolveTput, writeTput, revokeTput, burstDrainMs, burstP99Us, burstSize,
+                    burstTxns, burstTxnsConfirmed);
+        }
+    }
 
     // ------------------------------------------------------------------ driver
 
@@ -213,10 +288,7 @@ public final class Bench {
                 if (i < admitted.size() - 1) {
                     System.out.printf("    %s: stepped down to %d ops/s (%s)%n", name, rate, path);
                 }
-                return new Result(r.name(), r.throughput(), r.throughputCi(), r.p50(), r.p95(),
-                        r.p99(), r.notes() + "; admission path: " + path,
-                        r.resolveTput(), r.writeTput(), r.revokeTput(),
-                        r.burstDrainMs(), r.burstP99Us(), r.burstSize());
+                return r.withNotes(r.notes() + "; admission path: " + path);
             }
             System.out.printf("    %s: merged p99 %.0f ms exceeds the %.0f ms target at %d ops/s; "
                     + "stepping down%n", name, r.p99() / 1000.0, P99_TARGET_US / 1000.0, rate);
@@ -234,6 +306,8 @@ public final class Bench {
         double[] perRunWrite = new double[RUNS];
         double[] perRunRevoke = new double[RUNS];
         double[] perRunDrain = new double[RUNS];
+        double[] perRunBurstTxns = new double[RUNS];
+        double[] perRunBurstConfirmed = new double[RUNS];
         Histogram mergedBurst = new Histogram();
         int burstSize = 0;
         int batchSize = 250;
@@ -248,6 +322,8 @@ public final class Bench {
             perRunWrite[run] = o.writeThroughput;
             perRunRevoke[run] = o.revokeThroughput;
             perRunDrain[run] = o.burstDrainMs;
+            perRunBurstTxns[run] = o.burstTxns;
+            perRunBurstConfirmed[run] = o.burstTxnsConfirmed;
             mergedBurst.merge(o.burst);
             burstSize = o.burstSize;
             System.out.printf("  %-34s run %2d/%d: %8.0f ops/s  p99 %7.0f us%n",
@@ -270,7 +346,8 @@ public final class Bench {
                 Histogram.mean(perRunThroughput), Histogram.ci95(perRunThroughput),
                 merged.percentile(50), merged.percentile(95), merged.percentile(99), notes,
                 Histogram.mean(perRunResolve), Histogram.mean(perRunWrite), Histogram.mean(perRunRevoke),
-                Histogram.mean(perRunDrain), mergedBurst.percentile(99), burstSize);
+                Histogram.mean(perRunDrain), mergedBurst.percentile(99), burstSize,
+                Histogram.mean(perRunBurstTxns), Histogram.mean(perRunBurstConfirmed));
     }
 
     /**
@@ -280,10 +357,14 @@ public final class Bench {
      * @param burst latencies of the finite revoke burst, measured from the instant of injection
      * @param burstDrainMs wall time from injection to the last burst revocation committing
      * @param burstSize number of revocations in the burst
+     * @param burstTxns ordered revocation operations submitted from the burst's injection to the
+     *     end of the run; the bursty-revoke mix has no steady-state revokes, so all are the burst's
+     * @param burstTxnsConfirmed of those, how many the system acknowledged
      */
     record RunOutcome(Histogram hist, double throughput, double resolveThroughput,
                       double writeThroughput, double revokeThroughput,
-                      Histogram burst, double burstDrainMs, int burstSize, String notes) {}
+                      Histogram burst, double burstDrainMs, int burstSize,
+                      long burstTxns, long burstTxnsConfirmed, String notes) {}
 
     /**
      * One run against whichever system {@link #BACKEND} names.
@@ -331,6 +412,7 @@ public final class Bench {
             final Histogram burstHist = new Histogram();
             final AtomicLong burstLastCommitNanos = new AtomicLong(0);
             final AtomicLong burstStartNanos = new AtomicLong(0);
+            long txnsAtBurst = 0, confirmedAtBurst = 0;
 
             while (System.nanoTime() < endNanos) {
                 long now = System.nanoTime();
@@ -352,6 +434,8 @@ public final class Bench {
 
                 if (mix.burst && !burstFired && scheduled >= burstAt) {
                     burstFired = true;
+                    txnsAtBurst = backend.revocationTransactionsSubmitted();
+                    confirmedAtBurst = backend.revocationTransactionsConfirmed();
                     burstStartNanos.set(System.nanoTime());
                     fireRevocationBurst(backend, dids, burstHist, burstCommitted, burstRevokes,
                             BURST_SIZE, scheduled, burstLastCommitNanos);
@@ -400,10 +484,19 @@ public final class Bench {
             }
             double drainMs = (burstStartNanos.get() == 0) ? 0
                     : (burstLastCommitNanos.get() - burstStartNanos.get()) / 1e6;
+            long burstTxns = -1, burstConfirmed = -1;
+            if (burstFired && backend.revocationTransactionsSubmitted() >= 0) {
+                burstTxns = backend.revocationTransactionsSubmitted() - txnsAtBurst;
+                burstConfirmed = backend.revocationTransactionsConfirmed() - confirmedAtBurst;
+                System.out.printf("      burst: %d revocations -> %d ordered revocation "
+                        + "transaction(s) submitted, %d confirmed%n",
+                        BURST_SIZE, burstTxns, burstConfirmed);
+            }
             return new RunOutcome(hist, committed.get() / windowSeconds,
                     resolves.get() / windowSeconds, writes.get() / windowSeconds,
                     revokes.get() / windowSeconds,
-                    burstHist, drainMs, mix.burst ? BURST_SIZE : 0, backend.notes());
+                    burstHist, drainMs, mix.burst ? BURST_SIZE : 0,
+                    burstTxns, burstConfirmed, backend.notes());
             } finally {
                 // backend closed by try-with-resources
             }
@@ -488,6 +581,10 @@ public final class Bench {
                         r.name, r.burstSize, r.burstDrainMs,
                         r.burstDrainMs > 0 ? r.burstSize / (r.burstDrainMs / 1000.0) : 0,
                         r.burstP99Us);
+                if (r.burstTxns >= 0) {
+                    System.out.printf("  %s burst cost: %.1f ordered revocation transactions per run "
+                            + "(%.1f confirmed)%n", r.name, r.burstTxns, r.burstTxnsConfirmed);
+                }
             }
         }
     }
@@ -500,9 +597,93 @@ public final class Bench {
           .append("Warm-up ").append(WARMUP_MS).append(" ms, steady window ").append(STEADY_MS)
           .append(" ms. Operating points are re-measured and stepped down until the merged p99 is\n")
           .append("within ").append(Math.round(P99_TARGET_US / 1000)).append(" ms; the path taken is in each row's notes.\n\n");
-        // The provenance warning belongs only to runs served by the simulated ordering layer.
-        // Printing it on an Indy run -- measured against a live four-validator pool -- would be
-        // false, and a reviewer who spots one false disclaimer discounts the rest.
+        appendProvenance(sb);
+        sb.append("| Configuration | Throughput (ops/s) | p50 / p95 / p99 latency | Notes |\n");
+        sb.append("|---|---|---|---|\n");
+        for (Result r : results) {
+            appendRow(sb, r);
+        }
+        for (String pending : BACKEND.rowsNotMeasuredHere()) {
+            sb.append("| ").append(pending)
+              .append(" | — | — | run the other backend to fill this |\n");
+        }
+        sb.append("| Public-chain reference (ION/regtest) | — | — | M8: not yet implemented |\n\n");
+        for (Result r : results) {
+            appendBurst(sb, r);
+        }
+        appendPerOperation(sb, results);
+        java.nio.file.Files.writeString(java.nio.file.Path.of("RESULTS.md"), sb.toString());
+        System.out.println("\nwrote RESULTS.md");
+    }
+
+    /**
+     * Equal-offered-load results. The first heading is the marker compare.py uses to tell this file
+     * from an operating-point RESULTS.md, so the two never stand in for each other.
+     */
+    static void writeEqualLoadFile(List<Result> results, int n) throws Exception {
+        StringBuilder sb = new StringBuilder();
+        sb.append("# Equal offered load -- harness output\n\n");
+        sb.append("Generated by `vdr.bench.Bench` with -Dbench.equalLoad.*. n = ").append(n)
+          .append(", f = ").append((n - 1) / 3).append(", ").append(RUNS).append(" runs per configuration.\n")
+          .append("Warm-up ").append(WARMUP_MS).append(" ms, steady window ").append(STEADY_MS)
+          .append(" ms. Every level is measured at the offered rate given, with no sweep and no\n")
+          .append("step-down; a row whose p99 is past ").append(Math.round(P99_TARGET_US / 1000))
+          .append(" ms or that missed the schedule is marked SATURATED.\n\n");
+        appendProvenance(sb);
+        sb.append("| Configuration | Throughput (ops/s) | p50 / p95 / p99 latency | Notes |\n");
+        sb.append("|---|---|---|---|\n");
+        for (Result r : results) {
+            appendRow(sb, r);
+        }
+        sb.append('\n');
+        for (Result r : results) {
+            appendBurst(sb, r);
+        }
+        appendPerOperation(sb, results);
+        java.nio.file.Files.writeString(java.nio.file.Path.of("RESULTS.md"), sb.toString());
+        System.out.println("\nwrote RESULTS.md (equal offered load)");
+    }
+
+    static void appendRow(StringBuilder sb, Result r) {
+        sb.append(String.format("| %s | %.0f ± %.0f | %.0f / %.0f / %.0f µs | %s |%n",
+                r.name, r.throughput, r.throughputCi, r.p50, r.p95, r.p99, r.notes));
+    }
+
+    static void appendBurst(StringBuilder sb, Result r) {
+        if (r.burstSize <= 0) return;
+        // Equal-load files hold several bursts, so each names its row for compare.py.
+        sb.append("\n**Revoke burst")
+          .append(r.name.contains(" @ ") ? " (" + r.name + ")" : "").append(".** ").append(r.burstSize)
+          .append(" revocations drained in ").append(String.format("%.0f", r.burstDrainMs))
+          .append(" ms (").append(String.format("%.0f", r.burstDrainMs > 0
+                ? r.burstSize / (r.burstDrainMs / 1000.0) : 0))
+          .append(" revokes/s), burst p99 ").append(String.format("%.0f", r.burstP99Us))
+          .append(" \u00b5s. Burst arrivals share one injection instant, so they are\n")
+          .append("reported here rather than folded into the steady-mix percentiles above.\n");
+        if (r.burstTxns >= 0) {
+            // The drain is a per-BATCH cost: both systems aggregate revocations before ordering
+            // them. Saying how many transactions the burst became keeps it from being read as a
+            // per-revocation consensus cost.
+            sb.append(String.format("Burst cost: %.1f ordered revocation transactions per run "
+                    + "(%.1f confirmed).%n", r.burstTxns, r.burstTxnsConfirmed));
+        }
+    }
+
+    static void appendPerOperation(StringBuilder sb, List<Result> results) {
+        sb.append("## Per-operation throughput\n\n");
+        sb.append("| Configuration | resolve | register/update | revoke |\n|---|---|---|---|\n");
+        for (Result r : results) {
+            sb.append(String.format("| %s | %.0f | %.0f | %.0f |%n",
+                    r.name, r.resolveTput, r.writeTput, r.revokeTput));
+        }
+    }
+
+    /**
+     * The provenance warning belongs only to runs served by the simulated ordering layer.
+     * Printing it on an Indy run -- measured against a live four-validator pool -- would be
+     * false, and a reviewer who spots one false disclaimer discounts the rest.
+     */
+    static void appendProvenance(StringBuilder sb) {
         if (BACKEND.usesSimulatedReplication()) {
             sb.append("> **Provenance warning. These are not measurements of a BFT system.**\n")
               .append("> They were produced against the in-process simulated total-order layer\n")
@@ -523,35 +704,5 @@ public final class Bench {
               .append("> runs against the real engine, with both synthetic constants removed.\n")
               .append("> Run with -Dvdr.replication=bftsmart once the cluster is up.\n\n");
         }
-        sb.append("| Configuration | Throughput (ops/s) | p50 / p95 / p99 latency | Notes |\n");
-        sb.append("|---|---|---|---|\n");
-        for (Result r : results) {
-            sb.append(String.format("| %s | %.0f ± %.0f | %.0f / %.0f / %.0f µs | %s |%n",
-                    r.name, r.throughput, r.throughputCi, r.p50, r.p95, r.p99, r.notes));
-        }
-        for (String pending : BACKEND.rowsNotMeasuredHere()) {
-            sb.append("| ").append(pending)
-              .append(" | — | — | run the other backend to fill this |\n");
-        }
-        sb.append("| Public-chain reference (ION/regtest) | — | — | M8: not yet implemented |\n\n");
-        for (Result r : results) {
-            if (r.burstSize > 0) {
-                sb.append("\n**Revoke burst.** ").append(r.burstSize)
-                  .append(" revocations drained in ").append(String.format("%.0f", r.burstDrainMs))
-                  .append(" ms (").append(String.format("%.0f", r.burstDrainMs > 0
-                        ? r.burstSize / (r.burstDrainMs / 1000.0) : 0))
-                  .append(" revokes/s), burst p99 ").append(String.format("%.0f", r.burstP99Us))
-                  .append(" \u00b5s. Burst arrivals share one injection instant, so they are\n")
-                  .append("reported here rather than folded into the steady-mix percentiles above.\n");
-            }
-        }
-        sb.append("## Per-operation throughput\n\n");
-        sb.append("| Configuration | resolve | register/update | revoke |\n|---|---|---|---|\n");
-        for (Result r : results) {
-            sb.append(String.format("| %s | %.0f | %.0f | %.0f |%n",
-                    r.name, r.resolveTput, r.writeTput, r.revokeTput));
-        }
-        java.nio.file.Files.writeString(java.nio.file.Path.of("RESULTS.md"), sb.toString());
-        System.out.println("\nwrote RESULTS.md");
     }
 }

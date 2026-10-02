@@ -10,6 +10,10 @@
 # busy node cannot steal time from another. The Tailored BFT runner gets the same per-replica
 # budget: TAILORED_N x per-node vCPUs, one execution thread per replica (vdr.replicaThreads).
 #
+# The four BFT-SMaRt replicas (vdr-replica-0..3) get exactly what the four Indy nodes get:
+# replica i is capped at the per-node budget and pinned to node i+1's cores. The tailored-bft
+# runner, like indy-bench, is pinned to the leftover cores. Run one system at a time.
+#
 # Writes deploy/vps/.env, which docker compose reads automatically. Re-run it after resizing
 # the server or changing TAILORED_N. Overrides:
 #   NODE_CPUS=2 ./cpu-plan.sh          force the per-node budget
@@ -62,12 +66,15 @@ BENCH_CPUS="$TAILORED_CPUS"
 
 # Keep any user settings already in .env; replace only the lines this script owns.
 touch .env
-grep -vE '^(NODE_CPUS|NODE[1-4]_CPUSET|AUX_CPUSET|TAILORED_CPUS|BENCH_CPUS|TAILORED_N)=|^# cpu-plan' .env > .env.tmp || true
+grep -vE '^(NODE_CPUS|NODE[1-4]_CPUSET|REPLICA_CPUS|REPLICA[0-3]_CPUSET|AUX_CPUSET|TAILORED_CPUS|BENCH_CPUS|TAILORED_N)=|^# cpu-plan' .env > .env.tmp || true
 {
   cat .env.tmp
   echo "# cpu-plan.sh: $TOTAL vCPUs, $NODES nodes x $PER_NODE vCPU"
   echo "NODE_CPUS=$PER_NODE"
   for i in $(seq 1 $NODES); do echo "NODE${i}_CPUSET=${SETS[$(( i - 1 ))]}"; done
+  # BFT-SMaRt replica i on node i+1's cores, with the same cap.
+  echo "REPLICA_CPUS=$PER_NODE"
+  for i in $(seq 0 $(( NODES - 1 ))); do echo "REPLICA${i}_CPUSET=${SETS[$i]}"; done
   echo "AUX_CPUSET=$AUX_SET"
   echo "TAILORED_N=$TAILORED_N"
   echo "TAILORED_CPUS=$TAILORED_CPUS"
@@ -79,10 +86,14 @@ echo "vCPU plan ($TOTAL vCPUs on this server)"
 for i in $(seq 1 $NODES); do
   printf '  node%d      %s vCPU  cores %s\n' "$i" "$PER_NODE" "${SETS[$(( i - 1 ))]}"
 done
+for i in $(seq 0 $(( NODES - 1 ))); do
+  printf '  replica-%d  %s vCPU  cores %s (same as node%d)\n' "$i" "$PER_NODE" "${SETS[$i]}" $(( i + 1 ))
+done
 printf '  webserver  shared     cores %s\n' "$AUX_SET"
 printf '  tailored   %s vCPU  (n = %s replicas, %s vCPU each)\n' "$TAILORED_CPUS" "$TAILORED_N" \
   "$(awk -v a="$TAILORED_CPUS" -v b="$TAILORED_N" 'BEGIN { printf "%.2g", a / b }')"
 printf '  indy-bench %s vCPU  cores %s\n' "$BENCH_CPUS" "$AUX_SET"
+printf '  tailored-bft runner %s vCPU  cores %s (same as indy-bench)\n' "$BENCH_CPUS" "$AUX_SET"
 if [ "$POOL_OK" = no ]; then
   echo "WARNING: $TOTAL vCPUs cannot give 4 nodes one vCPU each; nodes share cores. Use a 4+ vCPU server." >&2
 fi

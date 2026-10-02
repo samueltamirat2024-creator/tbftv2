@@ -25,6 +25,7 @@ public final class TailoredBftBackend implements Backend {
     private final VdrClient issuer;
     private final Gateway gateway;
     private final int batchSize;
+    private final long maxBatchDelayMillis;
 
     /** Distinct client ids across concurrently live backends: BFT-SMaRt keys its session by id. */
     private static final java.util.concurrent.atomic.AtomicInteger CLIENT_IDS =
@@ -41,6 +42,7 @@ public final class TailoredBftBackend implements Backend {
         this.issuer = new VdrClient(cluster, "bench-issuer", kp);
         this.gateway = new Gateway(cluster, batchSize, maxBatchDelayMillis);
         this.batchSize = batchSize;
+        this.maxBatchDelayMillis = maxBatchDelayMillis;
     }
 
     @Override public String name() {
@@ -48,8 +50,9 @@ public final class TailoredBftBackend implements Backend {
     }
 
     @Override public String notes() {
-        return String.format("n=%d (f=%d), confidentiality off, fast path Tier 0, batchSize=%d, %s",
-                cluster.n(), cluster.f(), batchSize, cluster.describe());
+        return String.format("n=%d (f=%d), confidentiality off, fast path Tier 0, batchSize=%d, "
+                + "maxBatchDelay=%d ms, %s",
+                cluster.n(), cluster.f(), batchSize, maxBatchDelayMillis, cluster.describe());
     }
 
     @Override public List<String> populate(int count) {
@@ -93,6 +96,14 @@ public final class TailoredBftBackend implements Backend {
 
     @Override public void flushRevocations() {
         gateway.flush();
+    }
+
+    @Override public long revocationTransactionsSubmitted() {
+        return gateway.batchesSubmitted();
+    }
+
+    @Override public long revocationTransactionsConfirmed() {
+        return gateway.batchesCommitted();
     }
 
     @Override public void close() {

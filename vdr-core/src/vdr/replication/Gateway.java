@@ -31,6 +31,8 @@ public final class Gateway implements AutoCloseable {
     private final List<PendingRevoke> pending = new ArrayList<>();
     private long lastFlushMillis = System.currentTimeMillis();
     private long batchesSubmitted = 0;
+    private final java.util.concurrent.atomic.AtomicLong batchesCommitted =
+            new java.util.concurrent.atomic.AtomicLong();
     private final Thread flusher;
     private volatile boolean running = true;
 
@@ -60,7 +62,9 @@ public final class Gateway implements AutoCloseable {
         flusher.interrupt();
     }
 
-    public long batchesSubmitted() { return batchesSubmitted; }
+    public synchronized long batchesSubmitted() { return batchesSubmitted; }
+    /** Batches whose ordered operation completed without error. */
+    public long batchesCommitted() { return batchesCommitted.get(); }
     public int batchSize() { return batchSize; }
 
     /** Entry-point verification. Rejecting here saves a consensus instance; it never grants one. */
@@ -107,6 +111,7 @@ public final class Gateway implements AutoCloseable {
         batchesSubmitted++;
 
         cluster.invokeOrdered(op).whenComplete((replies, err) -> {
+            if (err == null) batchesCommitted.incrementAndGet();
             for (PendingRevoke p : batch) {
                 if (err != null) p.future.completeExceptionally(err);
                 else p.future.complete(replies);
