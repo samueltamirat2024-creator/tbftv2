@@ -1,0 +1,10 @@
+build/
+von-network/
+artifact/results/
+deploy/vps/results/
+**/.DS_Store
+**/__pycache__/
+.venv*/
+
+# Replicas read keys from the mounted config dir; private keys must not be baked into an image.
+config/keys/

@@ -1,0 +1,17 @@
+build/
+target/
+*.class
+.idea/
+.vscode/
+.DS_Store
+deploy/vps/results/
+*.env
+*.pem
+*.key
+hs_err_pid*.log
+core
+!core/
+core.*
+
+# Per-replica private keys: generate on each machine, never commit (config/system.config).
+config/keys/privatekey*

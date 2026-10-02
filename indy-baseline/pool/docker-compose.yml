@@ -1,0 +1,46 @@
+# Four-node Indy pool for the baseline (milestone B0).
+#
+# NOT RUNNABLE AS WRITTEN: the image digests are placeholders. Baseline plan §2 requires the
+# exact indy-node version and per-node image digests to be frozen and published BEFORE the first
+# measurement, so filling these in is part of B0, not an afterthought.
+#
+# Node memory: Indy releases warn of OOM during multi-hour sustained load on small-memory nodes.
+# Give the pool headroom and record it — a baseline that OOMs mid-run is a misconfiguration, not a
+# result (baseline plan §6).
+#
+# Placement: one node per machine in the real run. This compose file is for functional bring-up
+# only. Measuring four nodes on one host would make the hardware-parity row of the plan false.
+
+version: "3.8"
+
+x-node: &node
+  image: ghcr.io/hyperledger/indy-node@sha256:REPLACE_WITH_PINNED_DIGEST
+  restart: unless-stopped
+  volumes:
+    - ./genesis:/var/lib/indy/genesis:ro
+    - ./indy_config.py:/etc/indy/indy_config.py:ro
+  deploy:
+    resources:
+      limits:
+        memory: 32G
+      reservations:
+        cpus: "4"
+        memory: 16G
+
+services:
+  node1:
+    <<: *node
+    environment: [NODE_NAME=Node1, NODE_IP=10.0.0.11, NODE_PORT=9701, CLIENT_PORT=9702]
+    ports: ["9701:9701", "9702:9702"]
+  node2:
+    <<: *node
+    environment: [NODE_NAME=Node2, NODE_IP=10.0.0.12, NODE_PORT=9703, CLIENT_PORT=9704]
+    ports: ["9703:9703", "9704:9704"]
+  node3:
+    <<: *node
+    environment: [NODE_NAME=Node3, NODE_IP=10.0.0.13, NODE_PORT=9705, CLIENT_PORT=9706]
+    ports: ["9705:9705", "9706:9706"]
+  node4:
+    <<: *node
+    environment: [NODE_NAME=Node4, NODE_IP=10.0.0.14, NODE_PORT=9707, CLIENT_PORT=9708]
+    ports: ["9707:9707", "9708:9708"]

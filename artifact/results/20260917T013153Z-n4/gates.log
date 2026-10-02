@@ -1,0 +1,42 @@
+Tailored BFT VDR -- milestone gate suite
+==============================================================================
+
+[M1] Can a client write to a DID it does not control?
+        PASS
+
+[M1] Replay the same ordered log against fresh replicas: identical roots?
+        PASS
+
+[M2] Does the gateway's verdict ever substitute for the core's?
+        PASS
+
+[M3] Identical checkpoint roots across replicas after 10k ops?
+        PASS
+
+[M3] Can a replica serve a document with a proof from a root no replica committed?
+        PASS
+
+[M4] PERFORMANCE GATE: unordered resolve p50 must beat ordered resolve p50 by >=2x
+        fast-path p50 = 411.5 us, ordered p50 = 5135.5 us, speed-up = 12.5x
+        PASS
+
+[M5] Can a revoke be dropped from a batch without detection?
+        2000 revocations committed in 2 consensus instances (8 gateway batches, batchSize=250)
+        PASS
+
+[M6] Can a Byzantine replica return a forged document on the fast path?
+        PASS
+
+[M6] Does a stale-but-valid read ever satisfy a freshness-critical query?
+        PASS
+
+[M6] KEY SAFETY CLAIM: can any in-bound fault serve a missed revocation?
+        PASS
+
+[M6] Is the damage from a Byzantine issuer recoverable and bounded?
+        PASS
+
+[M7] Does enabling confidentiality break checkpoint-root equality?
+        PASS
+==============================================================================
+passed 12, failed 0

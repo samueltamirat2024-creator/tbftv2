@@ -1,0 +1,36 @@
+# n MUST be 3f+1. The chart refuses to render otherwise.
+replicaCount: 4
+
+image:
+  repository: tailored-bft-vdr
+  # Digest, not tag: plan §11 M8 publishes image digests before any measurement.
+  digest: "sha256:REPLACE_WITH_PINNED_DIGEST"
+  pullPolicy: IfNotPresent
+
+vdr:
+  maxBatchSize: 250          # swept; plan §3.4 measurement hook
+  maxBatchDelayMs: 20        # swept; plan §3.4 measurement hook
+  checkpointInterval: 5000   # sweep {1k, 5k, 20k}; Paper 2 §V-D
+  confidentiality: false     # optional layer, off by default; plan §8
+
+# Fault independence is bought by deployment diversity, not code diversity (plan §14, lesson 4).
+# DepSpace concluded that most real failures trace to infrastructure software and management
+# rather than application code, so the money goes into spreading replicas across failure domains
+# rather than writing the VDR twice. This is the assumption Paper 2's deployment section defends;
+# if every replica lands on one node, one zone or one administrator, the n = 3f+1 claim is
+# decorative.
+diversity:
+  # Hard anti-affinity: no two replicas on one node.
+  requireDistinctNodes: true
+  # Spread across zones, and ideally across operating system images and administrators.
+  topologySpreadKeys:
+    - topology.kubernetes.io/zone
+  nodeSelectorPerReplica: []   # e.g. [{os-image: ubuntu-22}, {os-image: debian-12}, ...]
+
+resources:
+  requests:
+    cpu: "2"
+    memory: 4Gi
+  limits:
+    cpu: "4"
+    memory: 8Gi

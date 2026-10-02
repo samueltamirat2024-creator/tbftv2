@@ -1,0 +1,21 @@
+{{- $n := int .Values.replicaCount -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vdr-config
+data:
+  hosts.config: |
+    {{- range $i := until $n }}
+    {{ $i }} vdr-{{ $i }}.vdr 11000 11001
+    {{- end }}
+  system.config: |
+    system.servers.num = {{ $n }}
+    system.servers.f = {{ div (sub $n 1) 3 }}
+    system.totalordermulticast.state_transfer = true
+    system.totalordermulticast.checkpoint_period = {{ .Values.vdr.checkpointInterval }}
+    system.communication.defaultkeys = false
+    system.communication.useSenderThread = true
+  vdr.properties: |
+    maxBatchSize={{ .Values.vdr.maxBatchSize }}
+    maxBatchDelayMs={{ .Values.vdr.maxBatchDelayMs }}
+    confidentiality={{ .Values.vdr.confidentiality }}

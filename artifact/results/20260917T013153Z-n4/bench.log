@@ -1,0 +1,58 @@
+Tailored BFT VDR -- evaluation harness
+n = 4 (f = 1), runs = 10, warm-up = 1000 ms, steady state = 1500 ms
+open-loop generator; no outliers discarded; percentiles from merged histogram
+==============================================================================================
+
+-- offered-load sweep, read-heavy
+    sweep: offered     50 ops/s -> achieved       50 ops/s  p99    26880 us  sustained
+    sweep: offered    100 ops/s -> achieved       99 ops/s  p99    16384 us  sustained
+    sweep: offered    250 ops/s -> achieved      249 ops/s  p99    33280 us  sustained
+    sweep: offered    500 ops/s -> achieved      499 ops/s  p99    26624 us  sustained
+    sweep: offered   1000 ops/s -> achieved      972 ops/s  p99    21760 us  sustained
+    sweep: offered   2000 ops/s -> achieved     1926 ops/s  p99    19968 us  sustained
+-- offered-load sweep, bursty-revoke
+    sweep: offered     50 ops/s -> achieved      580 ops/s  p99    39424 us  sustained
+    sweep: offered    100 ops/s -> achieved      631 ops/s  p99    11392 us  sustained
+    sweep: offered    250 ops/s -> achieved      781 ops/s  p99    29952 us  sustained
+    sweep: offered    500 ops/s -> achieved     1029 ops/s  p99    48128 us  sustained
+    sweep: offered   1000 ops/s -> achieved     1506 ops/s  p99    25600 us  sustained
+    sweep: offered   2000 ops/s -> achieved     2483 ops/s  p99    22784 us  sustained
+
+operating points: read-heavy 2000 ops/s, bursty-revoke 2000 ops/s
+
+  Tailored BFT VDR -- read-heavy     run  1/10:     1927 ops/s  p99   20736 us
+  Tailored BFT VDR -- read-heavy     run  2/10:     1923 ops/s  p99   18944 us
+  Tailored BFT VDR -- read-heavy     run  3/10:     1938 ops/s  p99   18432 us
+  Tailored BFT VDR -- read-heavy     run  4/10:     1929 ops/s  p99   19200 us
+  Tailored BFT VDR -- read-heavy     run  5/10:     1929 ops/s  p99   19456 us
+  Tailored BFT VDR -- read-heavy     run  6/10:     1928 ops/s  p99   18688 us
+  Tailored BFT VDR -- read-heavy     run  7/10:     1936 ops/s  p99   19200 us
+  Tailored BFT VDR -- read-heavy     run  8/10:     1924 ops/s  p99   19200 us
+  Tailored BFT VDR -- read-heavy     run  9/10:     1921 ops/s  p99   18432 us
+  Tailored BFT VDR -- read-heavy     run 10/10:     1917 ops/s  p99   20480 us
+  Tailored BFT VDR -- bursty-revoke  run  1/10:     2483 ops/s  p99   22784 us
+  Tailored BFT VDR -- bursty-revoke  run  2/10:     2485 ops/s  p99   23296 us
+  Tailored BFT VDR -- bursty-revoke  run  3/10:     2486 ops/s  p99   23296 us
+  Tailored BFT VDR -- bursty-revoke  run  4/10:     2482 ops/s  p99   23040 us
+  Tailored BFT VDR -- bursty-revoke  run  5/10:     2484 ops/s  p99   22784 us
+  Tailored BFT VDR -- bursty-revoke  run  6/10:     2486 ops/s  p99   23296 us
+  Tailored BFT VDR -- bursty-revoke  run  7/10:     2485 ops/s  p99   23296 us
+  Tailored BFT VDR -- bursty-revoke  run  8/10:     2486 ops/s  p99   23808 us
+  Tailored BFT VDR -- bursty-revoke  run  9/10:     2485 ops/s  p99   23552 us
+  Tailored BFT VDR -- bursty-revoke  run 10/10:     2485 ops/s  p99   23296 us
+
+==============================================================================================
+EVALUATION MATRIX (plan section 12)
+----------------------------------------------------------------------------------------------
+Configuration                      | Throughput (ops/s) | p50 / p95 / p99 (us)   | Notes
+----------------------------------------------------------------------------------------------
+Tailored BFT VDR -- read-heavy     |     1927 +/- 4      |    496 /   7040 / 18944  | n=4 (f=1), confidentiality off, fast path Tier 0
+Tailored BFT VDR -- bursty-revoke  |     2485 +/- 1      |    496 /  17664 / 23040  | n=4 (f=1), batchSize=250 at swept optimum
+Hyperledger Indy -- read-heavy     | not measured       | not measured           | run the other backend to fill this
+Hyperledger Indy -- bursty-revoke  | not measured       | not measured           | run the other backend to fill this
+----------------------------------------------------------------------------------------------
+  Tailored BFT VDR -- read-heavy per-operation: resolve 1829, register/update 79, revoke 20 ops/s
+  Tailored BFT VDR -- bursty-revoke per-operation: resolve 1762, register/update 197, revoke 525 ops/s
+  Tailored BFT VDR -- bursty-revoke burst: 800 revocations drained in 57 ms (14128 revokes/s), burst p99 59904 us
+
+wrote RESULTS.md

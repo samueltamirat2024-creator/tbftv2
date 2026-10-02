@@ -1,0 +1,17 @@
+# Environment
+
+captured_utc: 20260917T013153Z
+uname: Darwin Samuels-MacBook-Air.local 25.2.0 Darwin Kernel Version 25.2.0: Tue Nov 18 21:09:34 PST 2025; root:xnu-12377.61.12~1/RELEASE_ARM64_T8112 arm64
+
+## Java
+  openjdk version "21.0.12.1" 2026-08-18 LTS
+  OpenJDK Runtime Environment Temurin-21.0.12.1+1 (build 21.0.12.1+1-LTS)
+  OpenJDK 64-Bit Server VM Temurin-21.0.12.1+1 (build 21.0.12.1+1-LTS, mixed mode, sharing)
+
+## CPU / memory
+  model:   Apple M2
+  cores:   8
+  memory:  8192 MB
+
+## Source revision
+  git:     not a repository (distributed as an archive)

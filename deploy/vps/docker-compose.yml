@@ -1,0 +1,203 @@
+# Single-VPS experiment stack: a four-node Indy pool plus runners for both systems.
+#
+#   docker compose up -d --build            # Indy pool + ledger browser
+#   docker compose run --rm tailored        # Tailored BFT VDR: gates + harness
+#   docker compose run --rm indy-bench      # Indy baseline: probe + setup + harness
+#
+# FUNCTIONAL BRING-UP ONLY. Four nodes on one VPS share its CPU, disk and network, and the
+# Tailored BFT runner is still the in-JVM simulator. Nothing measured here goes in the paper;
+# see docs/BUILD-AND-RUN.md, "Laptop runs are for bring-up, not the paper".
+#
+# von-network images are linux/amd64 only, so the VPS must be x86-64.
+#
+# vCPU budget: every node runs on at least one whole vCPU. Run ./cpu-plan.sh first; it writes
+# .env with per-node vCPUs = max(1, total vCPUs / 4) and pins each node to its own cores
+# (4 vCPU server -> 1 vCPU per node, 8 vCPU server -> 2 vCPU per node). Without .env every
+# node is capped at 1 vCPU and left unpinned.
+
+name: vdr-experiments
+
+x-indy-node: &indy-node
+  image: von-network-base
+  build:
+    context: ../../von-network
+  restart: unless-stopped
+  # One node, at least one vCPU: hard cap here, per-node core pinning (cpuset) below.
+  cpus: ${NODE_CPUS:-1}
+  # Indy nodes hold a socket per peer and per client connection; the default 1024 file
+  # descriptors run out under sustained load.
+  ulimits:
+    nofile:
+      soft: 65536
+      hard: 65536
+  environment: &indy-env
+    # Fixed container addresses: every node and the web server generate the same genesis file
+    # from this list, and the runner reaches the nodes on these addresses.
+    IPS: 172.28.0.11,172.28.0.12,172.28.0.13,172.28.0.14
+    LOG_LEVEL: ${INDY_LOG_LEVEL:-warning}     # production level on both systems (baseline-tuning.md)
+    RUST_LOG: warning
+
+x-bench: &bench
+  image: vdr-bench
+  build:
+    context: ../..
+    dockerfile: deploy/vps/Dockerfile.bench
+  networks: [vdrnet]
+  # Tailored runner: TAILORED_N replicas x NODE_CPUS, each replica on its own thread
+  # (vdr.replicaThreads). The JVM sizes itself from this limit.
+  cpus: ${TAILORED_CPUS:-4}
+  # Both runners get the same limit so the two systems are measured in identical environments.
+  # The open-loop generator holds many concurrent connections (indy-vdr opens several ZeroMQ
+  # sockets per node); the default 1024 file descriptors run out mid-run. Record this setting
+  # in the published baseline configuration (M8).
+  ulimits:
+    nofile:
+      soft: 65536
+      hard: 65536
+
+# One BFT-SMaRt replica of the Tailored BFT VDR (BFT-SMaRt implementation plan WP6). Four of
+# these plus the `tailored-bft` runner replace the in-process simulator. They are in the
+# `bftsmart` profile, so `docker compose up -d` still brings up only the Indy pool.
+x-vdr-replica: &vdr-replica
+  <<: *bench
+  profiles: [bftsmart]
+  # Each replica owns its vCPUs, as the Indy validators do: a replica sharing a core with the
+  # ordering thread measures contention rather than consensus.
+  cpus: ${REPLICA_CPUS:-1}
+  volumes:
+    - ../../config:/work/config:ro
+  restart: unless-stopped
+
+services:
+  node1:
+    <<: *indy-node
+    command: ["bash", "-c", "cp /opt/vdr/indy_config.py /etc/indy/indy_config.py && exec ./scripts/start_node.sh 1"]
+    networks: { vdrnet: { ipv4_address: 172.28.0.11 } }
+    cpuset: "${NODE1_CPUSET:-}"
+    volumes:
+      - node1-data:/home/indy/ledger
+      - ./indy_config.py:/opt/vdr/indy_config.py:ro
+
+  node2:
+    <<: *indy-node
+    command: ["bash", "-c", "cp /opt/vdr/indy_config.py /etc/indy/indy_config.py && exec ./scripts/start_node.sh 2"]
+    networks: { vdrnet: { ipv4_address: 172.28.0.12 } }
+    cpuset: "${NODE2_CPUSET:-}"
+    volumes:
+      - node2-data:/home/indy/ledger
+      - ./indy_config.py:/opt/vdr/indy_config.py:ro
+
+  node3:
+    <<: *indy-node
+    command: ["bash", "-c", "cp /opt/vdr/indy_config.py /etc/indy/indy_config.py && exec ./scripts/start_node.sh 3"]
+    networks: { vdrnet: { ipv4_address: 172.28.0.13 } }
+    cpuset: "${NODE3_CPUSET:-}"
+    volumes:
+      - node3-data:/home/indy/ledger
+      - ./indy_config.py:/opt/vdr/indy_config.py:ro
+
+  node4:
+    <<: *indy-node
+    command: ["bash", "-c", "cp /opt/vdr/indy_config.py /etc/indy/indy_config.py && exec ./scripts/start_node.sh 4"]
+    networks: { vdrnet: { ipv4_address: 172.28.0.14 } }
+    cpuset: "${NODE4_CPUSET:-}"
+    volumes:
+      - node4-data:/home/indy/ledger
+      - ./indy_config.py:/opt/vdr/indy_config.py:ro
+
+  # Ledger browser. Also serves /genesis, which returns 503 until the pool is reachable — the
+  # indy-bench runner uses that as its readiness check.
+  webserver:
+    <<: *indy-node
+    command: bash -c 'sleep 10 && ./scripts/start_webserver.sh'
+    environment:
+      <<: *indy-env
+      REGISTER_NEW_DIDS: "False"   # the browser's DID form writes to the ledger; keep it off
+      # von-network's default (5 tries, 10 s apart) gives up before slow nodes finish starting.
+      POOL_CONNECTION_ATTEMPTS: "60"
+      POOL_CONNECTION_DELAY: "10"
+      LEDGER_INSTANCE_NAME: vdr-baseline
+    networks: { vdrnet: { ipv4_address: 172.28.0.20 } }
+    cpus: ${AUX_CPUS:-1}
+    cpuset: "${AUX_CPUSET:-}"
+    # Loopback only. Reach it with: ssh -L 9000:localhost:9000 <user>@<vps>
+    ports:
+      - "127.0.0.1:${WEB_SERVER_HOST_PORT:-9000}:8000"
+    volumes:
+      - webserver-ledger:/home/indy/ledger
+    depends_on: [node1, node2, node3, node4]
+
+  # Tailored BFT VDR: artifact/run-all.sh (environment, build, gates, harness).
+  tailored:
+    <<: *bench
+    profiles: [tailored]
+    command: ["./artifact/run-all.sh", "${TAILORED_N:-4}", "${TAILORED_MODE:-full}"]
+    volumes:
+      - ./results/tailored:/work/artifact/results
+
+  # ---- Tailored BFT VDR on BFT-SMaRt: four replica processes + one runner ----------------
+  # Bring them up with:  docker compose --profile bftsmart up -d
+  # Then measure with:   docker compose --profile bftsmart run --rm tailored-bft
+  vdr-replica-0:
+    <<: *vdr-replica
+    command: ["./vdr-bftsmart/build.sh", "replica", "0", "/work/config"]
+    networks: { vdrnet: { ipv4_address: 172.28.0.31, aliases: [vdr-replica-0] } }
+
+  vdr-replica-1:
+    <<: *vdr-replica
+    command: ["./vdr-bftsmart/build.sh", "replica", "1", "/work/config"]
+    networks: { vdrnet: { ipv4_address: 172.28.0.32, aliases: [vdr-replica-1] } }
+
+  vdr-replica-2:
+    <<: *vdr-replica
+    command: ["./vdr-bftsmart/build.sh", "replica", "2", "/work/config"]
+    networks: { vdrnet: { ipv4_address: 172.28.0.33, aliases: [vdr-replica-2] } }
+
+  vdr-replica-3:
+    <<: *vdr-replica
+    command: ["./vdr-bftsmart/build.sh", "replica", "3", "/work/config"]
+    networks: { vdrnet: { ipv4_address: 172.28.0.34, aliases: [vdr-replica-3] } }
+
+  # The harness against the real cluster. Same generator, same metrics, same admission rule as
+  # every other row -- only the replication layer differs (-Dvdr.replication=bftsmart).
+  tailored-bft:
+    <<: *bench
+    profiles: [bftsmart]
+    command: ["./artifact/run-all.sh", "${TAILORED_N:-4}", "${TAILORED_MODE:-full}"]
+    environment:
+      VDR_REPLICATION: bftsmart
+      VDR_BFTSMART_CONFIG: /work/config
+    volumes:
+      - ./results/tailored-bft:/work/artifact/results
+      - ../../config:/work/config:ro
+    depends_on: [vdr-replica-0, vdr-replica-1, vdr-replica-2, vdr-replica-3]
+
+  # Indy baseline: probe, one-time registry setup, then the same vdr.bench.Bench harness.
+  # The nofile limit comes from the shared x-bench anchor above.
+  indy-bench:
+    <<: *bench
+    profiles: [indy]
+    command: ["./deploy/vps/run-indy.sh"]
+    # Load generator only: pinned to the cores the nodes do not use (all cores on a 4 vCPU server).
+    cpus: ${BENCH_CPUS:-4}
+    cpuset: "${AUX_CPUSET:-}"
+    environment:
+      GENESIS_URL: http://webserver:8000/genesis
+      INDY_TRUSTEE_SEED: ${INDY_TRUSTEE_SEED:-000000000000000000000000Trustee1}
+      INDY_ENTRIES_PER_TXN: ${INDY_ENTRIES_PER_TXN:-}
+    volumes:
+      - ./results/indy:/results
+    depends_on: [webserver]
+
+networks:
+  vdrnet:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+  node4-data:
+  webserver-ledger:

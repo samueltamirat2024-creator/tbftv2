@@ -1,0 +1,60 @@
+{{- include "vdr.validateN" . -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: vdr
+spec:
+  serviceName: vdr
+  replicas: {{ .Values.replicaCount }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: vdr
+  template:
+    metadata:
+      labels:
+        app: vdr
+    spec:
+      {{- if .Values.diversity.requireDistinctNodes }}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: vdr
+              topologyKey: kubernetes.io/hostname
+      {{- end }}
+      {{- with .Values.diversity.topologySpreadKeys }}
+      topologySpreadConstraints:
+        {{- range . }}
+        - maxSkew: 1
+          topologyKey: {{ . }}
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: vdr
+        {{- end }}
+      {{- end }}
+      containers:
+        - name: replica
+          image: "{{ .Values.image.repository }}@{{ .Values.image.digest }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: REPLICA_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name   # vdr-0 .. vdr-(n-1); split in the entrypoint
+          ports:
+            - name: consensus
+              containerPort: 11000
+            - name: client
+              containerPort: 11001
+          volumeMounts:
+            - name: config
+              mountPath: /opt/vdr/config
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: vdr-config

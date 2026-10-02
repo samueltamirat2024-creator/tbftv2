@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Dependency descriptor ONLY: it records the coordinates and does NOT resolve. 1.2 is not on Maven
+  Central, and JitPack's POM for it declares no dependencies. The build is build.sh; fetch the
+  jars, checksum-pinned, from the upstream v1.2 tag with
+
+    ./vdr-bftsmart/fetch-jars.sh
+
+  BFT-SMaRt's ordering is used unmodified (plan §4). The version is pinned and recorded with every
+  result: an unpinned consensus library makes two runs incomparable.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>vdr</groupId>
+  <artifactId>vdr-bftsmart-deps</artifactId>
+  <version>1.0</version>
+  <packaging>jar</packaging>
+  <properties>
+    <maven.compiler.source>21</maven.compiler.source>
+    <maven.compiler.target>21</maven.compiler.target>
+  </properties>
+  <dependencies>
+    <dependency>
+      <groupId>com.github.bft-smart</groupId>
+      <artifactId>library</artifactId>
+      <version>1.2</version>
+    </dependency>
+  </dependencies>
+</project>

@@ -1,0 +1,20 @@
+# Runner image for both systems: JDK 21 for vdr-core and the FFM Indy binding, Python for the
+# one-time Indy registry setup. Build context is the repository root.
+FROM eclipse-temurin:21-jdk-jammy
+
+# indy-vdr 0.4.2 is the version the FFM binding was verified against (baseline-tuning.md).
+ARG INDY_VDR_VERSION=0.4.2
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3 python3-venv curl \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m venv /opt/venv \
+ && /opt/venv/bin/pip install --no-cache-dir -U pip \
+ && /opt/venv/bin/pip install --no-cache-dir \
+      "indy-vdr==${INDY_VDR_VERSION}" anoncreds base58 pynacl
+ENV PATH=/opt/venv/bin:$PATH
+
+WORKDIR /work
+COPY . .
+RUN ./build.sh && ./indy-baseline/build.sh

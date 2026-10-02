@@ -1,0 +1,6 @@
+apiVersion: v2
+name: tailored-bft-vdr
+description: n = 3f+1 replica group for the Tailored BFT VDR
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

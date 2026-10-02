@@ -1,0 +1,52 @@
+Picked up JAVA_TOOL_OPTIONS: -Djavax.net.ssl.trustStore=/etc/ssl/certs/java/cacerts -Djavax.net.ssl.trustStoreType=JKS -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=41759 -Dhttp.nonProxyHosts=localhost|127.0.0.1|::1|127.*|0.*|::|169.254.*|api.anthropic.com|api-staging.anthropic.com|api-pr-preview.anthropic.com|mcp-proxy.anthropic.com|mcp-proxy-staging.anthropic.com|registry.npmjs.org|jsr.io|npm.jsr.io|pypi.org|files.pythonhosted.org|index.crates.io|proxy.golang.org|host.docker.internal|10.*|172.16.*|172.17.*|172.18.*|172.19.*|172.20.*|172.21.*|172.22.*|172.23.*|172.24.*|172.25.*|172.26.*|172.27.*|172.28.*|172.29.*|172.30.*|172.31.*|192.168.*|100.64.0.0/10|*.svc.cluster.local|*.svc.cluster.local -Djdk.http.auth.tunneling.disabledSchemes= -Djdk.http.auth.proxying.disabledSchemes=
+Tailored BFT VDR -- milestone gate suite
+==============================================================================
+
+[M1] Can a client write to a DID it does not control?
+        PASS
+
+[M1] Replay the same ordered log against fresh replicas: identical roots?
+        PASS
+
+[M2] Does the gateway's verdict ever substitute for the core's?
+        PASS
+
+[M3] Identical checkpoint roots across replicas after 10k ops?
+        PASS
+
+[M3] Can a replica serve a document with a proof from a root no replica committed?
+        PASS
+
+[M4] PERFORMANCE GATE: unordered resolve p50 must beat ordered resolve p50 by >=2x
+        fast-path p50 = 410.6 us, ordered p50 = 4546.1 us, speed-up = 11.1x
+        PASS
+
+[M5] Can a revoke be dropped from a batch without detection?
+        2000 revocations committed in 3 consensus instances (8 gateway batches, batchSize=250)
+        PASS
+
+[M6] Can a Byzantine replica return a forged document on the fast path?
+        PASS
+
+[M6] Does a stale-but-valid read ever satisfy a freshness-critical query?
+        PASS
+
+[M6] KEY SAFETY CLAIM: can any in-bound fault serve a missed revocation?
+        PASS
+
+[M6] Is the damage from a Byzantine issuer recoverable and bounded?
+        PASS
+
+[M7] Does enabling confidentiality break checkpoint-root equality?
+        PASS
+
+[B1] Does the wire codec round-trip every operation and reply canonically?
+        PASS
+
+[B4] Does a replica restored from a snapshot reach the same state root?
+        PASS
+
+[B4] Does a snapshot leak per-replica confidential state?
+        PASS
+==============================================================================
+passed 15, failed 0

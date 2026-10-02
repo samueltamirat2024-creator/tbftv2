@@ -1,0 +1,30 @@
+# Real-engine gates ONLY (vdr-bftsmart/real-gates.sh). Layered over docker-compose.yml; never
+# used for a measured run, because it is the one place a replica can be started Byzantine.
+#
+# VDR_BYZANTINE_<i> selects replica i's fault behaviour (vdr.replication.ServiceReplica.Behaviour);
+# unset or empty is honest. The heap cap keeps five JVMs inside a small Docker VM; it is not a
+# tuning choice and does not apply to benchmark runs.
+x-gates-jvm: &gates-jvm
+  JAVA_TOOL_OPTIONS: "-Xmx512m"
+
+services:
+  vdr-replica-0:
+    environment: { <<: *gates-jvm, VDR_BYZANTINE: "${VDR_BYZANTINE_0:-}" }
+  vdr-replica-1:
+    environment: { <<: *gates-jvm, VDR_BYZANTINE: "${VDR_BYZANTINE_1:-}" }
+  vdr-replica-2:
+    environment: { <<: *gates-jvm, VDR_BYZANTINE: "${VDR_BYZANTINE_2:-}" }
+  vdr-replica-3:
+    environment: { <<: *gates-jvm, VDR_BYZANTINE: "${VDR_BYZANTINE_3:-}" }
+
+  # The gates client, on vdrnet so hosts.config's container names resolve. One `run` per phase.
+  gates-runner:
+    image: vdr-bench
+    profiles: [bftsmart]
+    networks: [vdrnet]
+    cpus: ${GATES_CPUS:-2}
+    environment:
+      <<: *gates-jvm
+      VDR_BFTSMART_CONFIG: /work/config
+    volumes:
+      - ../../config:/work/config:ro
