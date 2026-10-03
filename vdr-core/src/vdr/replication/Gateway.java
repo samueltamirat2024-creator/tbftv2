@@ -96,18 +96,27 @@ public final class Gateway implements AutoCloseable {
 
     public synchronized void flush() {
         if (pending.isEmpty()) return;
-        // one batch per (client, registry): all handles in a batch share one signature
-        String clientId = pending.get(0).clientId;
-        String registryId = pending.get(0).registryId;
-        byte[] payload = pending.get(0).reasonPayload;
-        List<String> handles = new ArrayList<>(pending.size());
-        for (PendingRevoke p : pending) handles.add(p.handle);
-
-        Op op = pending.get(0).signer.apply(
-                Op.revoke(clientId, registryId, handles, payload, System.nanoTime()));
-        List<PendingRevoke> batch = new ArrayList<>(pending);
+        // One ordered operation per (client, registry): all handles in an operation share one
+        // signature and one registry, so items for different registries must never share a batch.
+        // Grouping keeps first-arrival order of the groups, and arrival order within each group.
+        java.util.LinkedHashMap<String, List<PendingRevoke>> groups = new java.util.LinkedHashMap<>();
+        for (PendingRevoke p : pending) {
+            groups.computeIfAbsent(p.clientId + "\u0000" + p.registryId, k -> new ArrayList<>()).add(p);
+        }
         pending.clear();
         lastFlushMillis = System.currentTimeMillis();
+        for (List<PendingRevoke> batch : groups.values()) {
+            submitBatch(batch);
+        }
+    }
+
+    private void submitBatch(List<PendingRevoke> batch) {
+        PendingRevoke first = batch.get(0);
+        List<String> handles = new ArrayList<>(batch.size());
+        for (PendingRevoke p : batch) handles.add(p.handle);
+
+        Op op = first.signer.apply(
+                Op.revoke(first.clientId, first.registryId, handles, first.reasonPayload, System.nanoTime()));
         batchesSubmitted++;
 
         cluster.invokeOrdered(op).whenComplete((replies, err) -> {

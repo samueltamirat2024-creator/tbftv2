@@ -32,10 +32,20 @@ public final class TailoredBftBackend implements Backend {
             new java.util.concurrent.atomic.AtomicInteger(
                     Integer.getInteger("vdr.clientIdBase", 1001));
 
+    /**
+     * Each backend opens a POOL of BFT-SMaRt proxies with consecutive ids (base, base+1, ...,
+     * base+poolSize-1). Advancing the base by 1 per backend made consecutive backends -- one per
+     * sweep level and per run -- reuse all but one of the previous backend's ids against the same
+     * long-lived replicas, which still hold per-client session and sequence state for them. The
+     * stride keeps every backend's id range disjoint from every earlier one in this JVM.
+     */
+    private static final int CLIENT_ID_STRIDE =
+            Math.max(1000, Integer.getInteger("vdr.bftsmart.proxies", 16) + 1);
+
     public TailoredBftBackend(int n, int batchSize, long maxBatchDelayMillis) {
         // -Dvdr.replication picks the engine: the in-process simulator, or BFT-SMaRt on a real
         // cluster. Nothing else in this class changes between them (plan §4).
-        this.cluster = ReplicationFactory.create(n, CLIENT_IDS.getAndIncrement());
+        this.cluster = ReplicationFactory.create(n, CLIENT_IDS.getAndAdd(CLIENT_ID_STRIDE));
         // Fault injection never ships in a benchmark image (plan §4).
         this.cluster.assertNoByzantineInBenchmark();
         KeyPair kp = Crypto.generateKeyPair();
