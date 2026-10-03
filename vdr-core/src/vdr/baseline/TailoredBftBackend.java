@@ -42,10 +42,41 @@ public final class TailoredBftBackend implements Backend {
     private static final int CLIENT_ID_STRIDE =
             Math.max(1000, Integer.getInteger("vdr.bftsmart.proxies", 16) + 1);
 
+    /**
+     * ONE BFT-SMaRt client (one pool of proxies) per JVM, shared by every backend this harness
+     * creates -- one per sweep level and per run.
+     *
+     * <p>Opening a fresh proxy pool per run was measured to break every run after the first: thread
+     * dumps of the second run (2026-10-03) showed all 64 proxies waiting the full 30 s invoke timeout
+     * for replies to ordered requests while the leader replica sat idle, and every load-generator
+     * thread blocked the same way on Tier-0 reads. The first pool in a JVM was always served; later
+     * pools against the same long-lived replicas were not. The real-engine gates never hit this
+     * because they use one client per JVM. Sharing the pool removes per-run session churn from the
+     * measurement entirely; connection setup was never part of what a run measures.
+     *
+     * <p>The simulator keeps a fresh in-process cluster per backend, as before: it has no sessions.
+     */
+    private static Replication sharedReal;
+
+    private static synchronized Replication sharedRealCluster(int n) {
+        if (sharedReal == null) {
+            sharedReal = ReplicationFactory.create(n, CLIENT_IDS.getAndAdd(CLIENT_ID_STRIDE));
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                try { sharedReal.close(); } catch (RuntimeException ignored) { }
+            }, "bftsmart-client-close"));
+        } else if (sharedReal.n() != n) {
+            throw new IllegalStateException("shared BFT-SMaRt client is for n=" + sharedReal.n()
+                    + ", requested n=" + n);
+        }
+        return sharedReal;
+    }
+
     public TailoredBftBackend(int n, int batchSize, long maxBatchDelayMillis) {
         // -Dvdr.replication picks the engine: the in-process simulator, or BFT-SMaRt on a real
         // cluster. Nothing else in this class changes between them (plan §4).
-        this.cluster = ReplicationFactory.create(n, CLIENT_IDS.getAndAdd(CLIENT_ID_STRIDE));
+        this.cluster = ReplicationFactory.isSimulated()
+                ? ReplicationFactory.create(n, CLIENT_IDS.getAndAdd(CLIENT_ID_STRIDE))
+                : sharedRealCluster(n);
         // Fault injection never ships in a benchmark image (plan §4).
         this.cluster.assertNoByzantineInBenchmark();
         KeyPair kp = Crypto.generateKeyPair();
@@ -118,7 +149,9 @@ public final class TailoredBftBackend implements Backend {
 
     @Override public void close() {
         gateway.close();
-        cluster.close();
+        if (cluster != sharedReal) {
+            cluster.close();          // simulator: per-backend; the shared real client lives for the JVM
+        }
     }
 
     public Replication cluster() {
