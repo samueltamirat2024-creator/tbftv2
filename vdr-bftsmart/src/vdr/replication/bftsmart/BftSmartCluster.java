@@ -30,9 +30,17 @@ import java.util.concurrent.atomic.AtomicLong;
  * replica detectable at all. Collapsing the replies before the client sees them would remove it,
  * so the asynchronous proxy is used and every reply is kept.
  *
- * <p><b>Tier 0 really is one replica.</b> Reads are sent to an explicit target list: one replica
- * for Tier 0, f+1 for Tier 1. Sending a Tier-0 read to all n would measure a fan-out the design
- * does not claim and would make the M4 gate meaningless.
+ * <p><b>Tier 0 really is one replica -- in what is counted.</b> A Tier-0 read is answered by one
+ * replica and a Tier-1 read by f+1, and only those replicas' replies are accepted (the Collector's
+ * allowed set). On the wire, however, every unordered request is SENT to all n replicas. BFT-SMaRt
+ * 1.2's client calls waitForChannels(replyQuorum) before each send, so a send to fewer than a
+ * quorum leaves channel operations pending and the next send on that proxy stalls for its 1000 ms
+ * timeout (1.2, 2.0 and master alike). That stall capped the whole client at about one request per
+ * proxy per second. Sending to all n avoids it without changing what the client trusts: replies
+ * from replicas outside the allowed set are dropped unread, so latency is still the intended
+ * replica's own reply time. The cost is conservative and must be reported: replicas execute each
+ * unordered read n times rather than once (Tier 0) or f+1 times (Tier 1), which overstates
+ * replica-side read load and so understates Tailored-BFT read throughput.
  *
  * <p><b>Roots are gossiped, not polled per read.</b> {@code VdrClient} consults the trusted root on
  * every Tier-0 verification. Against the simulator that reads memory; over a network it would be a
@@ -115,8 +123,8 @@ public final class BftSmartCluster implements Replication {
     @Override
     public Reply readTier0(String did, int preferredReplica) {
         int[] target = {Math.floorMod(preferredReplica, n)};
-        List<Reply> replies = invoke(Codec.encode(Op.resolve("tier0", did)), target,
-                TOMMessageType.UNORDERED_REQUEST, 1);
+        List<Reply> replies = invoke(Codec.encode(Op.resolve("tier0", did)), allTargets(), target,
+                TOMMessageType.UNORDERED_REQUEST, 1, timeoutMs);
         if (replies.isEmpty()) {
             throw new IllegalStateException("no Tier-0 reply from replica " + target[0]
                     + " within " + timeoutMs + " ms");
@@ -126,14 +134,14 @@ public final class BftSmartCluster implements Replication {
 
     @Override
     public List<Reply> readTier1(String did, int startReplica) {
-        return invoke(Codec.encode(Op.resolve("tier1", did)), targets(startReplica, f + 1),
-                TOMMessageType.UNORDERED_REQUEST, f + 1);
+        return invoke(Codec.encode(Op.resolve("tier1", did)), allTargets(),
+                targets(startReplica, f + 1), TOMMessageType.UNORDERED_REQUEST, f + 1, timeoutMs);
     }
 
     @Override
     public List<Reply> revocationTier1(String registryId, String handle, int startReplica) {
-        return invoke(Codec.encode(Op.revocationStatus("rev1", registryId, handle)),
-                targets(startReplica, f + 1), TOMMessageType.UNORDERED_REQUEST, f + 1);
+        return invoke(Codec.encode(Op.revocationStatus("rev1", registryId, handle)), allTargets(),
+                targets(startReplica, f + 1), TOMMessageType.UNORDERED_REQUEST, f + 1, timeoutMs);
     }
 
     @Override public byte[] trustedRoot() {
@@ -185,7 +193,7 @@ public final class BftSmartCluster implements Replication {
      * @return the reply, or null if the replica did not answer within {@code waitMs}
      */
     public Reply rootOf(int replica, long waitMs) {
-        List<Reply> replies = invoke(Codec.encode(Op.root("root")), new int[] {replica},
+        List<Reply> replies = invoke(Codec.encode(Op.root("root")), allTargets(), new int[] {replica},
                 TOMMessageType.UNORDERED_REQUEST, 1, waitMs);
         return replies.isEmpty() ? null : replies.get(0);
     }
@@ -220,11 +228,16 @@ public final class BftSmartCluster implements Replication {
      * decision belongs there, not here.
      */
     private List<Reply> invoke(byte[] request, int[] targets, TOMMessageType type, int needed) {
-        return invoke(request, targets, type, needed, timeoutMs);
+        return invoke(request, targets, targets, type, needed, timeoutMs);
     }
 
-    private List<Reply> invoke(byte[] request, int[] targets, TOMMessageType type, int needed,
-                               long timeoutMs) {
+    /**
+     * @param sendTo replicas the request goes to on the wire
+     * @param accept replicas whose replies are counted; any other reply is dropped unread. See the
+     *     class doc for why unordered reads send to all n but accept only 1 or f+1.
+     */
+    private List<Reply> invoke(byte[] request, int[] sendTo, int[] accept, TOMMessageType type,
+                               int needed, long timeoutMs) {
         AsynchServiceProxy proxy;
         try {
             proxy = proxies.poll(timeoutMs, TimeUnit.MILLISECONDS);
@@ -236,10 +249,10 @@ public final class BftSmartCluster implements Replication {
             throw new IllegalStateException("no BFT-SMaRt proxy free within " + timeoutMs
                     + " ms; raise -Dvdr.bftsmart.proxies above " + allProxies.size());
         }
-        Collector collector = new Collector(targets.length, needed);
+        Collector collector = new Collector(accept, needed);
         int operationId = -1;
         try {
-            operationId = proxy.invokeAsynchRequest(request, targets, collector, type);
+            operationId = proxy.invokeAsynchRequest(request, sendTo, collector, type);
             collector.await(timeoutMs);
             return collector.replies();
         } finally {
@@ -255,12 +268,14 @@ public final class BftSmartCluster implements Replication {
 
         private final int expected;
         private final int needed;
+        private final java.util.Set<Integer> allowed = new java.util.HashSet<>();
         private final CountDownLatch done = new CountDownLatch(1);
         private final Map<Integer, Reply> bySender = new TreeMap<>();
         private final Map<String, Integer> byDigest = new TreeMap<>();
 
-        Collector(int expected, int needed) {
-            this.expected = expected;
+        Collector(int[] accept, int needed) {
+            for (int a : accept) allowed.add(a);
+            this.expected = allowed.size();
             this.needed = needed;
         }
 
@@ -272,6 +287,9 @@ public final class BftSmartCluster implements Replication {
         }
 
         @Override public void replyReceived(RequestContext context, TOMMessage reply) {
+            if (!allowed.contains(reply.getSender())) {
+                return;                                       // sent to, but not asked: not counted
+            }
             byte[] content = reply.getContent();
             if (content == null || content.length == 0) {
                 return;
