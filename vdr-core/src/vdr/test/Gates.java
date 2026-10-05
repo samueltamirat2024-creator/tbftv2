@@ -46,6 +46,7 @@ public final class Gates {
         bStepDownAdmission();
         bSnapshotRestoresIdenticalRoot();
         bSnapshotExcludesPerReplicaState();
+        bIncrementalCheckpointEqualsScratch();
 
         System.out.println("=".repeat(78));
         System.out.printf("passed %d, failed %d%n", passed, failed);
@@ -570,6 +571,60 @@ public final class Gates {
                 String hex = Crypto.hex(snap0);
                 check(!hex.contains(Crypto.hex(Crypto.sha256(payload, Crypto.intToBytes(0)))),
                         "replica 0's PVSS share is present in the snapshot");
+            }
+        });
+    }
+
+    /**
+     * Checkpoints are maintained incrementally (vdr.merkle.IncrementalMerkle). The incremental
+     * root must equal a root computed from scratch over the same state after every kind of
+     * operation, every Tier-0 proof cut from it must verify, and a restored replica must agree.
+     */
+    private static void bIncrementalCheckpointEqualsScratch() {
+        gate("B5", "Does the incrementally maintained checkpoint equal a from-scratch rebuild?", () -> {
+            try (SimulatedCluster c = SimulatedCluster.standard(4)) {
+                VdrClient alice = client(c, "alice");
+                VdrStore s0 = c.replica(0).store();
+                int ops = 0;
+                for (int i = 0; i < 300; i++) {
+                    alice.register("did:vdr:inc" + i, ("d" + i).getBytes(StandardCharsets.UTF_8));
+                    if (i % 3 == 0) {
+                        alice.update("did:vdr:inc" + i, 1, ("u" + i).getBytes(StandardCharsets.UTF_8),
+                                alice.publicKey());
+                    }
+                    if (i % 25 == 24) {
+                        List<String> hs = new ArrayList<>();
+                        for (int k = 0; k < 20; k++) hs.add(handle(i * 100 + k));
+                        alice.revoke(Records.registryIdFor("did:vdr:inc" + (i % 7)), hs, null);
+                    }
+                    if (i % 50 == 49) {
+                        ops++;
+                        check(Arrays.equals(s0.incrementalStateRoot(), s0.stateRoot()),
+                                "incremental root diverged from the scratch root after " + (i + 1)
+                                + " registrations");
+                    }
+                }
+                check(ops > 0, "no cross-check ran");
+                for (int r = 0; r < 4; r++) {
+                    check(Arrays.equals(c.replica(r).store().incrementalStateRoot(),
+                            c.replica(r).store().stateRoot()), "replica " + r + " diverged");
+                }
+                // Proofs cut from the incremental tree verify with the unchanged client verifier.
+                s0.forceCheckpoint();
+                for (int i = 0; i < 300; i += 37) {
+                    Reply rep = s0.resolveUnordered("did:vdr:inc" + i);
+                    check(rep.ok && Merkle.verify(rep.checkpointRoot, rep.leafKey,
+                            Records.DidDoc.leafBytes("did:vdr:inc" + i, rep.version, rep.value),
+                            rep.proof), "Tier-0 proof from the incremental tree did not verify");
+                }
+                Reply rev = s0.revocationStatusUnordered(Records.registryIdFor("did:vdr:inc" + (24 % 7)),
+                        handle(2400));
+                check(rev.revoked, "a committed revocation is not visible in the checkpoint");
+                // State transfer rebuilds the indexes: same root.
+                VdrStore restored = new VdrStore(9, 4096, 2000);
+                restored.installIdenticalProjection(s0.serialiseIdenticalProjection());
+                check(Arrays.equals(restored.checkpoint().root, s0.checkpoint().root),
+                        "restored checkpoint root differs from the source's");
             }
         });
     }

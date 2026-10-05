@@ -148,8 +148,9 @@ public final class VdrReplica extends DefaultSingleRecoverable {
                 ? null : ServiceReplica.Behaviour.valueOf(fault.trim().toUpperCase());
 
         System.out.printf("VDR replica %d starting: config=%s, maxBatchSize=%d, "
-                        + "merkleCheckpointInterval=%d ops%n",
-                id, configDir, maxBatchSize, checkpointInterval);
+                        + "merkleCheckpointInterval=%d ops, Ed25519=%s, vCPUs=%d, maxHeap=%d MB%n",
+                id, configDir, maxBatchSize, checkpointInterval, vdr.crypto.Crypto.ed25519Provider(),
+                Runtime.getRuntime().availableProcessors(), Runtime.getRuntime().maxMemory() >> 20);
         if (byzantine != null && byzantine != ServiceReplica.Behaviour.HONEST) {
             System.out.printf("VDR replica %d BYZANTINE MODE: %s (fault injection; never in a "
                     + "measured run)%n", id, byzantine);

@@ -1,3 +1,6 @@
+> **For the four-row comparison table (4 nodes × 1 vCPU), use `./measure-table.sh` —
+> see [MEASURE-TABLE.md](MEASURE-TABLE.md).** The rest of this page describes the individual services.
+
 # Running both systems on one virtual server (Docker Compose)
 
 This runs a four-node Indy pool and both benchmark runners on a single Linux VPS.

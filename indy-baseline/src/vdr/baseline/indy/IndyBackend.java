@@ -1,6 +1,7 @@
 package vdr.baseline.indy;
 
 import vdr.baseline.Backend;
+import vdr.crypto.Crypto;
 
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
@@ -330,9 +331,10 @@ public final class IndyBackend implements Backend {
     @Override public String notes() {
         return String.format("n=%d, %d revoked indices per "
                 + "REVOC_REG_ENTRY or %d ms (swept optimum), serial accumulator chain, "
-                + "fresh registry per run (%d revoked at open), client config %s, indy-vdr %s",
+                + "fresh registry per run (%d revoked at open), client config %s, indy-vdr %s, "
+                + "client Ed25519 %s",
                 nodeCount, entriesPerTransaction, maxBatchDelayMs, Math.max(revokedAtOpen, 0),
-                poolConfig, vdr.version());
+                poolConfig, vdr.version(), Crypto.ed25519Provider());
     }
 
     /**
@@ -370,18 +372,30 @@ public final class IndyBackend implements Backend {
             throws Exception {
         // Key rotation: the realistic SSI update, and what the Tailored BFT update does.
         // Only the owner may rotate a verkey, so the request is signed by the DID's current key.
-        Identity current = identities.get(did);
-        if (current == null) {
-            throw new IllegalStateException("update of a DID this backend never wrote: " + did);
-        }
-        Identity next = Identity.fromSeed(current.did,
-                sha256(salt + ":rot:" + current.did + ":" + keyRotations.getAndIncrement()));
-        submitNym(current.did, current.privateKey, current.did, next.verkey, null).join();
-        identities.put(did, next);
-        if (!did.equals(current.did)) {
-            identities.put(current.did, next);
+        // One rotation in flight per DID, as on the Tailored side: two concurrent rotations would
+        // both be signed with the same current key and the second would be rejected by the pool.
+        java.util.concurrent.locks.ReentrantLock lock =
+                didLocks.computeIfAbsent(did, k -> new java.util.concurrent.locks.ReentrantLock());
+        lock.lock();
+        try {
+            Identity current = identities.get(did);
+            if (current == null) {
+                throw new IllegalStateException("update of a DID this backend never wrote: " + did);
+            }
+            Identity next = Identity.fromSeed(current.did,
+                    sha256(salt + ":rot:" + current.did + ":" + keyRotations.getAndIncrement()));
+            submitNym(current.did, current.privateKey, current.did, next.verkey, null).join();
+            identities.put(did, next);
+            if (!did.equals(current.did)) {
+                identities.put(current.did, next);
+            }
+        } finally {
+            lock.unlock();
         }
     }
+
+    private final ConcurrentHashMap<String, java.util.concurrent.locks.ReentrantLock> didLocks =
+            new ConcurrentHashMap<>();
 
     @Override public void resolve(String did, int replicaHint) throws Exception {
         Identity id = identities.get(did);
@@ -577,10 +591,9 @@ public final class IndyBackend implements Backend {
     private void sign(long requestHandle, PrivateKey key) {
         try {
             byte[] input = vdr.signatureInput(requestHandle);
-            Signature s = Signature.getInstance("Ed25519");
-            s.initSign(key);
-            s.update(input);
-            vdr.setSignature(requestHandle, s.sign());
+            // The same signer the Tailored client uses (BouncyCastle when present, else the JDK),
+            // so client-side signing cost is identical on both systems.
+            vdr.setSignature(requestHandle, Crypto.sign(key, input));
         } catch (Exception e) {
             throw new IllegalStateException("signing failed", e);
         }

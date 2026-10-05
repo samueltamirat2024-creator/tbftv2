@@ -23,7 +23,7 @@ LIB=vdr-bftsmart/lib
 CONFIG="${VDR_BFTSMART_CONFIG:-config}"
 
 mkdir -p "$OUT" "$LIB"
-[ -d "$CORE" ] || ./build.sh >/dev/null
+[ -d "$CORE/vdr" ] || ./build.sh >/dev/null
 
 # ---------------------------------------------------------------- classpath
 if [ -n "${BFTSMART_JARS:-}" ]; then
@@ -54,8 +54,14 @@ MSG
   CP="$CORE:build/bftsmart-stubs"
 fi
 
-javac -nowarn -cp "$CP" -d "$OUT" $(find vdr-bftsmart/src -name '*.java')
-echo "compiled to $OUT"
+# VDR_SKIP_BUILD=1 (set by the compose replicas): the image already compiled the module; four
+# 1 vCPU replicas recompiling it at the same instant only delays startup.
+if [ "${VDR_SKIP_BUILD:-0}" = "1" ] && [ "$STUBBED" = "0" ] && [ -d "$OUT/vdr/replication/bftsmart" ]; then
+  :
+else
+  javac -nowarn -cp "$CP" -d "$OUT" $(find vdr-bftsmart/src -name '*.java')
+  echo "compiled to $OUT"
+fi
 
 refuse_if_stubbed() {
   if [ "$STUBBED" = "1" ]; then
@@ -69,12 +75,16 @@ case "${1:-}" in
   replica)
     refuse_if_stubbed
     [ -n "${2:-}" ] || { echo "usage: $0 replica <id> [configDir]" >&2; exit 2; }
-    exec java -cp "$CORE:$OUT:$JARS" -Dlogback.configurationFile="$(cd "$CONFIG" && pwd)/logback.xml" \
+    # shellcheck disable=SC2086
+    exec java ${VDR_REPLICA_JAVA_OPTS:-} -cp "$CORE:$OUT:$JARS" \
+      -Dlogback.configurationFile="$(cd "$CONFIG" && pwd)/logback.xml" \
       vdr.replication.bftsmart.VdrReplica "$2" "${3:-$CONFIG}"
     ;;
   bench)
     refuse_if_stubbed
-    exec java -cp "$CORE:$OUT:$JARS" -Dlogback.configurationFile="$(cd "$CONFIG" && pwd)/logback.xml" \
+    # shellcheck disable=SC2086
+    exec java ${VDR_BENCH_JAVA_OPTS:-} -cp "$CORE:$OUT:$JARS" \
+      -Dlogback.configurationFile="$(cd "$CONFIG" && pwd)/logback.xml" \
       -Dvdr.replication=bftsmart \
       -Dvdr.bftsmart.config="$CONFIG" \
       vdr.bench.Bench "${2:-4}"

@@ -1,9 +1,12 @@
-# Runner image for both systems: JDK 21 for vdr-core and the FFM Indy binding, Python for the
-# one-time Indy registry setup. Build context is the repository root.
+# Runner image for both systems: JDK 21 for vdr-core, the BFT-SMaRt replicas and the FFM Indy
+# binding, Python for the one-time Indy registry setup. Build context is the repository root.
 FROM eclipse-temurin:21-jdk-jammy
 
 # indy-vdr 0.4.2 is the version the FFM binding was verified against (baseline-tuning.md).
 ARG INDY_VDR_VERSION=0.4.2
+# Fast Ed25519 for the replicas and both load generators (vdr.crypto.Crypto.FastEd25519).
+# Optional: if the download fails the JDK's Ed25519 is used and every run says so in its notes.
+ARG BCPROV_VERSION=1.78.1
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends python3 python3-venv curl \
@@ -17,4 +20,19 @@ ENV PATH=/opt/venv/bin:$PATH
 
 WORKDIR /work
 COPY . .
-RUN ./build.sh && ./indy-baseline/build.sh
+
+# BouncyCastle from Maven Central, checked against the SHA-1 Central publishes next to it (what
+# Maven itself verifies). Its SHA-256 is printed into the build log and into every run's
+# environment.txt, so the exact jar behind a result is on record.
+RUN set -e; J="bcprov-jdk18on-${BCPROV_VERSION}.jar"; \
+    U="https://repo1.maven.org/maven2/org/bouncycastle/bcprov-jdk18on/${BCPROV_VERSION}/$J"; \
+    if curl -fsSL -o "/tmp/$J" "$U" && curl -fsSL -o "/tmp/$J.sha1" "$U.sha1" \
+       && echo "$(cut -c1-40 "/tmp/$J.sha1")  /tmp/$J" | sha1sum -c --quiet -; then \
+      mv "/tmp/$J" vdr-bftsmart/lib/ && sha256sum "vdr-bftsmart/lib/$J"; \
+    else \
+      echo "WARNING: could not fetch $J; Ed25519 falls back to the JDK (about 20x slower)"; \
+    fi; rm -f /tmp/bcprov*
+
+# Compile everything once, here. Replicas then start in seconds with VDR_SKIP_BUILD=1 instead of
+# four 1 vCPU containers compiling the same sources at the same moment.
+RUN ./build.sh && ./vdr-bftsmart/build.sh && ./indy-baseline/build.sh

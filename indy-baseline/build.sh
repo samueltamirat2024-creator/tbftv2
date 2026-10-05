@@ -17,6 +17,11 @@ javac --release 21 --enable-preview -nowarn -cp "$CORE" -d "$OUT" \
 
 LIB="${2:-${INDY_VDR_LIB:-}}"
 
+# Optional fast Ed25519 (BouncyCastle) for client-side signing -- the same signer the Tailored
+# client uses, so both generators pay the same per-write signing cost. See vdr.crypto.Crypto.
+FASTCRYPTO="$(find vdr-bftsmart/lib -name 'bcprov-*.jar' 2>/dev/null | head -1)"
+CORE_CP="$CORE${FASTCRYPTO:+:$FASTCRYPTO}"
+
 case "${1:-}" in
   probe)
     if [ -z "$LIB" ]; then
@@ -39,7 +44,7 @@ MSG
     : "${INDY_GENESIS:?set INDY_GENESIS to the pool transactions genesis file}"
     : "${INDY_REVOC_REG_DEF_ID:?set INDY_REVOC_REG_DEF_ID (printed by pool/setup_registry.py)}"
     exec java --enable-preview --enable-native-access=ALL-UNNAMED \
-      -cp "$CORE:$OUT" \
+      -cp "$CORE_CP:$OUT" \
       -Dvdr.backend=indy \
       -Dindy.lib="$INDY_VDR_LIB" \
       -Dindy.genesis="$INDY_GENESIS" \

@@ -27,9 +27,17 @@ public final class Merkle {
     private final byte[] root;
 
     public Merkle(SortedMap<String, byte[]> orderedLeaves) {
+        this(orderedLeaves, false);
+    }
+
+    /**
+     * @param prehashed true when the map's values are already leaf hashes ({@link #leafHash}),
+     *     so a tree rebuilt from cached leaves does not hash every leaf again
+     */
+    private Merkle(SortedMap<String, byte[]> orderedLeaves, boolean prehashed) {
         for (Map.Entry<String, byte[]> e : orderedLeaves.entrySet()) {
             keys.add(e.getKey());
-            leaves.add(Crypto.sha256(LEAF_PREFIX, e.getKey().getBytes(StandardCharsets.UTF_8), e.getValue()));
+            leaves.add(prehashed ? e.getValue() : leafHash(e.getKey(), e.getValue()));
         }
         if (leaves.isEmpty()) {
             root = Crypto.sha256("EMPTY_VDR_STATE");
@@ -48,6 +56,31 @@ public final class Merkle {
             level = next;
         }
         root = level.get(0);
+    }
+
+    /** A tree over leaves whose hashes were computed with {@link #leafHash} beforehand. */
+    public static Merkle ofLeafHashes(SortedMap<String, byte[]> orderedLeafHashes) {
+        return new Merkle(orderedLeafHashes, true);
+    }
+
+    /** The domain-separated leaf hash: H(0x00, key, leafValue). */
+    public static byte[] leafHash(String key, byte[] leafValue) {
+        return Crypto.sha256(LEAF_PREFIX, key.getBytes(StandardCharsets.UTF_8), leafValue);
+    }
+
+    /** The domain-separated internal-node hash: H(0x01, left, right). */
+    public static byte[] nodeHash(byte[] left, byte[] right) {
+        return Crypto.sha256(NODE_PREFIX, left, right);
+    }
+
+    /** True if {@code key} is a leaf of this tree. */
+    public boolean contains(String key) {
+        return Collections.binarySearch(keys, key) >= 0;
+    }
+
+    /** Root without a defensive copy, for callers that never mutate it. */
+    byte[] rootUnsafe() {
+        return root;
     }
 
     public byte[] root() {
