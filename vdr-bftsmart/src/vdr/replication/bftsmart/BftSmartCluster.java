@@ -52,11 +52,20 @@ public final class BftSmartCluster implements Replication {
     private final int n;
     private final int f;
     private final long timeoutMs = Long.getLong("vdr.bftsmart.timeoutMs", 30_000L);
-    private final long rootRefreshMs = Long.getLong("vdr.bftsmart.rootRefreshMs", 1_000L);
+    private final long rootRefreshMs = Long.getLong("vdr.bftsmart.rootRefreshMs", 250L);
+    /**
+     * Bound on one root refresh. A refresh asks all n replicas and returns at f+1 agreement or when
+     * all n answered; with a replica down and replicas on different checkpoints it would otherwise
+     * wait the full request timeout (30 s) inside a read.
+     */
+    private final long rootWaitMs = Long.getLong("vdr.bftsmart.rootWaitMs", 500L);
+    private final Object refreshLock = new Object();
+    private CompletableFuture<Void> refreshInFlight;
 
     /** Proxies are not thread-safe, so the open-loop generator borrows one per in-flight call. */
     private final BlockingQueue<AsynchServiceProxy> proxies;
     private final List<AsynchServiceProxy> allProxies = new ArrayList<>();
+    private final AsynchServiceProxy rootProxy;
     private final String configDir = System.getProperty("vdr.bftsmart.config", "config");
 
     private volatile byte[] cachedRoot;
@@ -73,19 +82,25 @@ public final class BftSmartCluster implements Replication {
     public BftSmartCluster(int n, int clientIdBase) {
         this.n = n;
         this.f = (n - 1) / 3;
-        int poolSize = Integer.getInteger("vdr.bftsmart.proxies", 16);
+        int poolSize = Integer.getInteger("vdr.bftsmart.proxies", 32);
         this.proxies = new ArrayBlockingQueue<>(poolSize);
         for (int i = 0; i < poolSize; i++) {
             AsynchServiceProxy p = new AsynchServiceProxy(clientIdBase + i, configDir);
             allProxies.add(p);
             proxies.add(p);
         }
-        refreshRoot();
+        // Root gossip gets its own session. Sharing the pool let a saturated read path starve
+        // the refreshes, so the client's trusted root aged and every Tier-0 read fell back to
+        // Tier 1 / Tier 2 -- turning overload into a collapse. Only one refresh is ever in flight
+        // (refreshLock), so one proxy is enough.
+        this.rootProxy = new AsynchServiceProxy(clientIdBase + poolSize, configDir);
+        allProxies.add(rootProxy);
+        refreshRoot(timeoutMs);
         this.rootRefresher = new Thread(() -> {
             while (running) {
                 try {
                     Thread.sleep(rootRefreshMs);
-                    refreshRoot();
+                    refreshTrustedRootNow();
                 } catch (InterruptedException e) {
                     return;
                 } catch (RuntimeException e) {
@@ -106,16 +121,34 @@ public final class BftSmartCluster implements Replication {
     @Override public boolean simulated() { return false; }
 
     @Override public String describe() {
-        return String.format("BFT-SMaRt (n=%d, f=%d, config=%s, %d proxies, root refresh %d ms)",
-                n, f, configDir, allProxies.size(), rootRefreshMs);
+        return String.format("BFT-SMaRt (n=%d, f=%d, config=%s, %d proxies + 1 root-gossip proxy, "
+                + "root refresh %d ms + on demand)", n, f, configDir, allProxies.size() - 1, rootRefreshMs);
     }
 
     // ------------------------------------------------------------- ordered path
 
+    /**
+     * Ordered calls wait for consensus, so each one blocks a thread for a full round. The old code
+     * ran them on {@code ForkJoinPool.commonPool()}, whose parallelism is (vCPUs - 1): 3 threads on
+     * a 4 vCPU runner, 1 on a 2 vCPU one. Every ordered write, every revocation batch and all 400
+     * population registers queued behind those few threads, which capped write throughput at
+     * ~3 / consensus latency independently of the cluster. A dedicated cached pool removes the
+     * cap; the real limit is now the proxy pool (-Dvdr.bftsmart.proxies), as intended. Platform
+     * threads, not virtual ones: BFT-SMaRt's client blocks inside synchronized sections, which
+     * would pin virtual-thread carriers.
+     */
+    private static final java.util.concurrent.ExecutorService ORDERED_CALLS =
+            java.util.concurrent.Executors.newCachedThreadPool(r -> {
+                Thread t = new Thread(r, "vdr-ordered");
+                t.setDaemon(true);
+                return t;
+            });
+
     @Override
     public CompletableFuture<List<Reply>> invokeOrdered(Op op) {
+        byte[] request = Codec.encode(op);       // encode on the caller: Op is not shared state
         return CompletableFuture.supplyAsync(() ->
-                invoke(Codec.encode(op), allTargets(), TOMMessageType.ORDERED_REQUEST, f + 1));
+                invoke(request, allTargets(), TOMMessageType.ORDERED_REQUEST, f + 1), ORDERED_CALLS);
     }
 
     // ----------------------------------------------------------- unordered path
@@ -158,9 +191,42 @@ public final class BftSmartCluster implements Replication {
      * A root backed by f+1 replicas is backed by at least one honest replica, which is what makes
      * it safe to verify Tier-0 proofs against.
      */
-    private void refreshRoot() {
-        List<Reply> replies = invoke(Codec.encode(Op.root("root")), allTargets(),
-                TOMMessageType.UNORDERED_REQUEST, f + 1);
+    @Override
+    public void refreshTrustedRootNow() {
+        CompletableFuture<Void> mine = null, theirs;
+        synchronized (refreshLock) {
+            if (refreshInFlight == null) {
+                refreshInFlight = mine = new CompletableFuture<>();
+            }
+            theirs = refreshInFlight;
+        }
+        if (mine == null) {
+            try {
+                theirs.get(rootWaitMs * 2, TimeUnit.MILLISECONDS);
+            } catch (Exception ignored) {
+                // a slow refresh costs this read a Tier-1 fallback, never a wrong answer
+            }
+            return;
+        }
+        try {
+            refreshRoot(rootWaitMs);
+        } catch (RuntimeException e) {
+            System.err.println("checkpoint-root refresh failed: " + e);
+        } finally {
+            synchronized (refreshLock) {
+                refreshInFlight = null;
+            }
+            mine.complete(null);
+        }
+    }
+
+    private void refreshRoot(long waitMs) {
+        int[] all = allTargets();
+        List<Reply> replies;
+        synchronized (rootProxy) {
+            replies = invokeOn(rootProxy, Codec.encode(Op.root("root")), all, all,
+                    TOMMessageType.UNORDERED_REQUEST, f + 1, waitMs);
+        }
         Map<String, Integer> tally = new TreeMap<>();
         Map<String, byte[]> byHex = new TreeMap<>();
         long[] epochs = new long[replies.size()];
@@ -202,7 +268,7 @@ public final class BftSmartCluster implements Replication {
     public void checkpointEverywhere() {
         // Ordered, so every replica cuts at the same sequence number and the roots stay identical.
         invokeOrderedSync(Op.checkpoint("bench", nonces.getAndIncrement()));
-        refreshRoot();
+        refreshRoot(timeoutMs);
     }
 
     // ------------------------------------------------------------------ plumbing
@@ -249,6 +315,16 @@ public final class BftSmartCluster implements Replication {
             throw new IllegalStateException("no BFT-SMaRt proxy free within " + timeoutMs
                     + " ms; raise -Dvdr.bftsmart.proxies above " + allProxies.size());
         }
+        try {
+            return invokeOn(proxy, request, sendTo, accept, type, needed, timeoutMs);
+        } finally {
+            proxies.add(proxy);
+        }
+    }
+
+    /** One request on a proxy the caller already owns exclusively. */
+    private List<Reply> invokeOn(AsynchServiceProxy proxy, byte[] request, int[] sendTo, int[] accept,
+                                 TOMMessageType type, int needed, long timeoutMs) {
         Collector collector = new Collector(accept, needed);
         int operationId = -1;
         try {
@@ -259,7 +335,6 @@ public final class BftSmartCluster implements Replication {
             if (operationId >= 0) {
                 proxy.cleanAsynchRequest(operationId);
             }
-            proxies.add(proxy);
         }
     }
 

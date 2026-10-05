@@ -1,6 +1,7 @@
 package vdr.store;
 
 import vdr.crypto.Crypto;
+import vdr.merkle.IncrementalMerkle;
 import vdr.merkle.Merkle;
 import vdr.model.Fingerprint;
 import vdr.model.Protection;
@@ -49,10 +50,20 @@ public final class VdrStore implements VdrPolicy.View {
     // ---- per-replica state (NEVER in the state root; see plan section 5) ---------
     private final TreeMap<String, byte[]> confidentialShares = new TreeMap<>();
 
-    private long seq = 0;
+    // ---- derived, maintained incrementally (rebuilt from the above on state transfer) ----------
+    /** Leaf hashes of the replica-identical projection, bucketed; see IncrementalMerkle. */
+    private final IncrementalMerkle tree = new IncrementalMerkle();
+    /** did -> latest document, as the read path needs it at a checkpoint. */
+    private final CowBucketMap<Records.DidDoc> latestDocs = new CowBucketMap<>();
+
+    private volatile long seq = 0;
     private long revocationEpoch = 0;        // monotone; never recomputed by scanning registries
     private long opsSinceCheckpoint = 0;
-    private Checkpoint checkpoint;
+    /**
+     * Immutable, so the unordered read path reads it without taking the store's lock: a Tier-0
+     * read no longer waits behind an ordered operation (or the checkpoint it cuts) to finish.
+     */
+    private volatile Checkpoint checkpoint;
 
     public VdrStore(int replicaId, int maxBatchSize, long checkpointInterval) {
         this.replicaId = replicaId;
@@ -115,6 +126,7 @@ public final class VdrStore implements VdrPolicy.View {
         versions.computeIfAbsent(op.did, k -> new TreeMap<>()).put(1L, doc);
         heads.put(op.did, new Records.DidHead(op.did, 1, currentEpoch(), false));
         headIndex.put(indexKey, op.did);
+        indexDoc(doc);
         return new Reply(replicaId, true, null, null, 1, currentEpoch(), seq, null, null, null, false);
     }
 
@@ -150,6 +162,7 @@ public final class VdrStore implements VdrPolicy.View {
                 Crypto.hex(Crypto.sha256(prev.docBytes())));
         vs.put(newVersion, doc);
         heads.put(op.did, new Records.DidHead(op.did, newVersion, currentEpoch(), false));
+        indexDoc(doc);
         return new Reply(replicaId, true, null, null, newVersion, currentEpoch(), seq, null, null, null, false);
     }
 
@@ -173,6 +186,7 @@ public final class VdrStore implements VdrPolicy.View {
                 reg.accumulator = Crypto.hex(Crypto.sha256(
                         Crypto.unhex(reg.accumulator), Crypto.unhex(hh)));
                 String leafKey = revEntryLeafKey(registryId, hh);
+                tree.put(leafKey, revEntryLeaf(registryId, hh));
                 revEntryInserter.put(leafKey, op.clientId);
                 if (op.reasonPayload != null) {
                     // Confidentiality layer (L2), optional: the PR field is stored as a
@@ -186,6 +200,7 @@ public final class VdrStore implements VdrPolicy.View {
         reg.deltaDigest = Crypto.hex(Crypto.sha256(String.join(",", handleHashes)));
         reg.epoch++;                    // revocation epoch advances on every committed batch
         revocationEpoch++;
+        tree.put(revAccLeafKey(registryId), revAccLeaf(reg));
         forceCheckpoint();              // V6: checkpoint at the revocation-epoch boundary
         return new Reply(replicaId, true, null, null, 0, reg.epoch, seq, checkpoint.root, null, null, true);
     }
@@ -217,9 +232,10 @@ public final class VdrStore implements VdrPolicy.View {
      * announcement of plan §3.3 in request form: over a real network a client cannot read a
      * replica's memory, so it asks, and believes a root only when f+1 replicas return the same one.
      */
-    public synchronized Reply rootReply() {
-        return new Reply(replicaId, true, null, checkpoint.root, 0, checkpoint.epoch,
-                checkpoint.seq, checkpoint.root, null, null, false);
+    public Reply rootReply() {
+        Checkpoint cp = checkpoint;
+        return new Reply(replicaId, true, null, cp.root, 0, cp.epoch,
+                cp.seq, cp.root, null, null, false);
     }
 
     // ============================================================== read fast path
@@ -232,12 +248,12 @@ public final class VdrStore implements VdrPolicy.View {
      * power is to serve a stale-but-valid document from an older checkpoint, bounded by the
      * checkpoint interval. Tier 1 is the escape hatch for revocation freshness.
      */
-    public synchronized Reply resolveUnordered(String did) {
+    public Reply resolveUnordered(String did) {
         return resolveFrom(checkpoint, did);
     }
 
     /** Same read, served from an explicitly chosen checkpoint (used to model a stale replica). */
-    public synchronized Reply resolveFrom(Checkpoint cp, String did) {
+    public Reply resolveFrom(Checkpoint cp, String did) {
         Records.DidDoc doc = cp.latestByDid.get(did);
         if (doc == null) return Reply.denied(replicaId, "RESOLVE_UNKNOWN_DID", seq);
         String leafKey = didDocLeafKey(did, doc.version());
@@ -251,18 +267,19 @@ public final class VdrStore implements VdrPolicy.View {
      * <REVENTRY, registryId, H(credentialHandle), PR> -- an equality match on a COMPARABLE
      * field, so the replica set never learns the handle in plaintext.
      */
-    public synchronized Reply revocationStatusUnordered(String registryId, String credentialHandle) {
+    public Reply revocationStatusUnordered(String registryId, String credentialHandle) {
         return revocationStatusFrom(checkpoint, registryId, credentialHandle);
     }
 
-    public synchronized Reply revocationStatusFrom(Checkpoint cp, String registryId, String credentialHandle) {
+    public Reply revocationStatusFrom(Checkpoint cp, String registryId, String credentialHandle) {
         String hh = Crypto.hex(Crypto.sha256(credentialHandle));
         List<String> template = Records.revocationTemplate(registryId, hh);
         List<String> templateFp = Fingerprint.of(template, Records.V_REVENTRY);
         // The comparable field is already the hash, so the template fingerprint carries H(H(handle));
         // matching is performed against the checkpoint's entry set via the same transform.
-        boolean revoked = cp.revokedHandleHashes.contains(registryId + "|" + hh);
-        String leafKey = revoked ? revEntryLeafKey(registryId, hh) : revAccLeafKey(registryId);
+        String entryKey = revEntryLeafKey(registryId, hh);
+        boolean revoked = cp.tree.contains(entryKey);
+        String leafKey = revoked ? entryKey : revAccLeafKey(registryId);
         Merkle.Proof proof = cp.tree.prove(leafKey);
         return new Reply(replicaId, true, null,
                 Fingerprint.key(templateFp).getBytes(StandardCharsets.UTF_8),
@@ -284,35 +301,70 @@ public final class VdrStore implements VdrPolicy.View {
      * confidentiality layer is switched on, silently invalidating every read proof.
      */
     private Checkpoint buildCheckpoint() {
-        TreeMap<String, byte[]> leaves = new TreeMap<>();
-        TreeMap<String, Records.DidDoc> latestByDid = new TreeMap<>();
-        TreeSet<String> revoked = new TreeSet<>();
+        // Incremental: only the leaves written since the previous checkpoint are re-hashed, and
+        // only their buckets' paths to the root are recomputed (IncrementalMerkle). The leaves are
+        // still exactly the identical projection enumerated in leavesFromScratch() below.
+        IncrementalMerkle.Snapshot t = tree.snapshot();
+        return new Checkpoint(t, t.root(), currentEpoch(), seq, latestDocs.snapshot());
+    }
 
+    /** The leaves of the identical projection, enumerated from state (the old, O(state) path). */
+    private TreeMap<String, byte[]> leavesFromScratch() {
+        TreeMap<String, byte[]> leaves = new TreeMap<>();
         for (Map.Entry<String, TreeMap<Long, Records.DidDoc>> e : versions.entrySet()) {
             for (Records.DidDoc d : e.getValue().values()) {
                 leaves.put(didDocLeafKey(d.did(), d.version()), d.leafBytes());   // public projection
             }
-            Records.DidHead h = heads.get(e.getKey());
-            if (h != null) latestByDid.put(e.getKey(), e.getValue().get(h.latestVersion()));
         }
         for (RevRegistry reg : registries.values()) {
-            leaves.put(revAccLeafKey(reg.registryId), Crypto.sha256(
-                    reg.registryId.getBytes(StandardCharsets.UTF_8),
-                    Crypto.longToBytes(reg.epoch),
-                    Crypto.unhex(reg.accumulator)));
+            leaves.put(revAccLeafKey(reg.registryId), revAccLeaf(reg));
             for (String hh : reg.handleHashes) {
                 // the COMPARABLE hash only -- never the payload, which is a per-replica share
-                leaves.put(revEntryLeafKey(reg.registryId, hh),
-                        Crypto.sha256(reg.registryId.getBytes(StandardCharsets.UTF_8), Crypto.unhex(hh)));
-                revoked.add(reg.registryId + "|" + hh);
+                leaves.put(revEntryLeafKey(reg.registryId, hh), revEntryLeaf(reg.registryId, hh));
             }
         }
-        Merkle tree = new Merkle(leaves);
-        return new Checkpoint(tree, tree.root(), currentEpoch(), seq, latestByDid, revoked);
+        return leaves;
     }
 
+    private static byte[] revAccLeaf(RevRegistry reg) {
+        return Crypto.sha256(reg.registryId.getBytes(StandardCharsets.UTF_8),
+                Crypto.longToBytes(reg.epoch), Crypto.unhex(reg.accumulator));
+    }
+
+    private static byte[] revEntryLeaf(String registryId, String hh) {
+        return Crypto.sha256(registryId.getBytes(StandardCharsets.UTF_8), Crypto.unhex(hh));
+    }
+
+    /** Records a new document version in the incremental indexes. */
+    private void indexDoc(Records.DidDoc doc) {
+        tree.put(didDocLeafKey(doc.did(), doc.version()), doc.leafBytes());
+        latestDocs.put(doc.did(), doc);
+    }
+
+    /** Rebuilds the incremental indexes from state (state transfer). */
+    private void reindexFromState() {
+        tree.clear();
+        latestDocs.clear();
+        for (Map.Entry<String, byte[]> e : leavesFromScratch().entrySet()) {
+            tree.put(e.getKey(), e.getValue());
+        }
+        for (Map.Entry<String, TreeMap<Long, Records.DidDoc>> e : versions.entrySet()) {
+            Records.DidHead h = heads.get(e.getKey());
+            if (h != null) latestDocs.put(e.getKey(), e.getValue().get(h.latestVersion()));
+        }
+    }
+
+    /** Root of the incrementally maintained tree over the CURRENT state (gate B5 cross-check). */
+    public synchronized byte[] incrementalStateRoot() {
+        return tree.snapshot().root();
+    }
+
+    /**
+     * Root computed from scratch over the current state, independent of the incremental indexes.
+     * Gates compare it with {@link #incrementalStateRoot()}: the two must always be equal.
+     */
     public synchronized byte[] stateRoot() {
-        return buildCheckpoint().root;
+        return IncrementalMerkle.fromScratch(leavesFromScratch()).root();
     }
 
     public synchronized String stateRootHex() {
@@ -338,8 +390,13 @@ public final class VdrStore implements VdrPolicy.View {
      * registries, the blacklist and inserter map, the sequence number and the revocation epoch.
      */
     public synchronized byte[] serialiseIdenticalProjection() {
-        try (java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream(1 << 16);
-             java.io.DataOutputStream out = new java.io.DataOutputStream(bos)) {
+        // BFT-SMaRt asks for this every checkpoint_period consensus instances, on its delivery
+        // thread. Buffered (DataOutputStream straight onto a ByteArrayOutputStream takes a monitor
+        // per byte of every int) and pre-sized from the previous snapshot (no regrow-and-copy).
+        java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream(
+                (int) Math.min(Integer.MAX_VALUE - 64, Math.max(1 << 16, lastSnapshotBytes + (lastSnapshotBytes >> 3))));
+        try (java.io.DataOutputStream out = new java.io.DataOutputStream(
+                new java.io.BufferedOutputStream(bos, 1 << 16))) {
             out.writeInt(SNAPSHOT_FORMAT);
             out.writeLong(seq);
             out.writeLong(revocationEpoch);
@@ -389,7 +446,9 @@ public final class VdrStore implements VdrPolicy.View {
                 Codec.writeString(out, e.getValue());
             }
             out.flush();
-            return bos.toByteArray();
+            byte[] snapshot = bos.toByteArray();
+            lastSnapshotBytes = snapshot.length;
+            return snapshot;
         } catch (java.io.IOException e) {
             throw new IllegalStateException("could not serialise the state snapshot", e);
         }
@@ -475,14 +534,17 @@ public final class VdrStore implements VdrPolicy.View {
 
             // Rebuild the checkpoint from the restored state. A recovered replica that kept its
             // old checkpoint would serve Tier-0 reads proved against a root nobody committed.
+            reindexFromState();
             this.checkpoint = buildCheckpoint();
         } catch (java.io.IOException e) {
             throw new IllegalStateException("could not install the state snapshot", e);
         }
     }
 
+    private long lastSnapshotBytes = 0;
+
     /** Bumped whenever the snapshot layout changes, so mismatched builds fail loudly. */
-    private static final int SNAPSHOT_FORMAT = 1;
+    private static final int SNAPSHOT_FORMAT = 2;     // 2: bucketed incremental Merkle root
 
     private long currentEpoch() {
         return revocationEpoch;
@@ -547,21 +609,19 @@ public final class VdrStore implements VdrPolicy.View {
 
     /** An immutable checkpoint: what Tier-0/1 reads are served from and proved against. */
     public static final class Checkpoint {
-        public final Merkle tree;
+        public final IncrementalMerkle.Snapshot tree;
         public final byte[] root;
         public final long epoch;
         public final long seq;
-        public final TreeMap<String, Records.DidDoc> latestByDid;
-        public final TreeSet<String> revokedHandleHashes;
+        final CowBucketMap.Snapshot<Records.DidDoc> latestByDid;
 
-        Checkpoint(Merkle tree, byte[] root, long epoch, long seq,
-                   TreeMap<String, Records.DidDoc> latestByDid, TreeSet<String> revokedHandleHashes) {
+        Checkpoint(IncrementalMerkle.Snapshot tree, byte[] root, long epoch, long seq,
+                   CowBucketMap.Snapshot<Records.DidDoc> latestByDid) {
             this.tree = tree;
             this.root = root;
             this.epoch = epoch;
             this.seq = seq;
             this.latestByDid = latestByDid;
-            this.revokedHandleHashes = revokedHandleHashes;
         }
 
         public String rootHex() { return Crypto.hex(root); }

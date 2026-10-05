@@ -49,6 +49,50 @@ public final class Bench {
     static final int DID_POOL = 400;
 
     /**
+     * Sweep runs may use shorter windows than the reported runs: a sweep level only has to show
+     * whether the schedule is kept, and the chosen level is then re-measured with the full
+     * WARMUP_MS / STEADY_MS / RUNS (and stepped down if its merged p99 misses the target). Defaults
+     * keep the plan's protocol (sweep windows = measurement windows).
+     */
+    static final long SWEEP_WARMUP_MS = Long.getLong("bench.sweepWarmupMs", WARMUP_MS);
+    static final long SWEEP_STEADY_MS = Long.getLong("bench.sweepSteadyMs", STEADY_MS);
+
+    /**
+     * Bisection steps between the last sustained and the first saturated sweep level, so the
+     * operating point lands near the knee without hand-tuning a level list per machine. 0 keeps
+     * the plain level list. Each step is one sweep run.
+     */
+    static final int REFINE_STEPS = Integer.getInteger("bench.refine", 0);
+
+    /** Which mixes this invocation measures: read-heavy, bursty-revoke (default both). */
+    static final List<String> MIXES = List.of(System.getProperty("bench.mixes",
+            "read-heavy,bursty-revoke").replace(" ", "").split(","));
+
+    /**
+     * Load-generator threads. "cached" (default): an unbounded pool, so the generator is truly
+     * open-loop -- the old fixed pool of 8 x vCPUs capped in-flight operations at 32 on a 4 vCPU
+     * box, i.e. at most 32 / latency ops/s, which throttled Indy (whose writes take seconds) far
+     * below its real capacity and turned the "open loop" into a closed one. "virtual": one
+     * virtual thread per operation. "fixed": the old behaviour, for comparison only.
+     */
+    static final String EXECUTOR = System.getProperty("bench.executor", "cached");
+
+    static ExecutorService newGeneratorPool() {
+        return switch (EXECUTOR) {
+            case "virtual" -> Executors.newVirtualThreadPerTaskExecutor();
+            case "fixed" -> Executors.newFixedThreadPool(
+                    Math.max(4, Runtime.getRuntime().availableProcessors() * 8));
+            // Platform threads by default: BFT-SMaRt's client and indy-vdr's FFM upcalls block in
+            // places that would pin virtual-thread carriers.
+            default -> Executors.newCachedThreadPool(r -> {
+                Thread t = new Thread(r, "bench-op");
+                t.setDaemon(true);
+                return t;
+            });
+        };
+    }
+
+    /**
      * Paper 2 section III states the VDR's performance target as sub-500 ms p99 read latency.
      * The sweep uses it as the admission criterion for an operating point, so a level whose
      * percentiles describe a growing queue is never reported as the system's result.
@@ -70,7 +114,19 @@ public final class Bench {
      */
     static final BackendFactory BACKEND = BackendFactory.fromSystemProperties();
 
-    public static void main(String[] args) throws Exception {
+    public static void main(String[] args) {
+        try {
+            run(args);
+        } catch (Throwable t) {
+            // Exit explicitly: the BFT-SMaRt client's non-daemon threads would keep a failed run's
+            // JVM (and its client sessions) alive.
+            t.printStackTrace();
+            System.out.flush();
+            System.exit(1);
+        }
+    }
+
+    static void run(String[] args) throws Exception {
         int n = args.length > 0 ? Integer.parseInt(args[0]) : 4;
         System.out.println(BACKEND.displayName() + " -- evaluation harness");
         System.out.printf("n = %d (f = %d), runs = %d, warm-up = %d ms, steady state = %d ms%n",
@@ -104,21 +160,28 @@ public final class Bench {
                         System.getProperty("bench.levels", "10,20,50,100,250,500,1000,2000").split(","))
                 .map(String::trim).filter(s -> !s.isEmpty())
                 .mapToInt(Integer::parseInt).toArray();
-        System.out.println("\n-- offered-load sweep, read-heavy");
-        List<Integer> rhLevels = sweepOperatingPoint(n, Mix.READ_HEAVY, levels, 250);
-        System.out.println("-- offered-load sweep, bursty-revoke");
-        List<Integer> brLevels = sweepOperatingPoint(n, Mix.BURSTY_REVOKE, levels, 250);
-        System.out.printf("%ncandidate operating points: read-heavy %d ops/s, bursty-revoke %d ops/s"
-                        + " (each re-measured below)%n%n",
-                rhLevels.get(rhLevels.size() - 1), brLevels.get(brLevels.size() - 1));
-
+        System.out.printf("generator executor = %s, sweep windows = %d ms / %d ms, refine steps = %d, "
+                + "mixes = %s%n", EXECUTOR, SWEEP_WARMUP_MS, SWEEP_STEADY_MS, REFINE_STEPS, MIXES);
         String label = BACKEND.displayName();
-        Result readHeavy = measureWithStepDown(label + " -- read-heavy", n, Mix.READ_HEAVY, rhLevels);
-        Result bursty = measureWithStepDown(label + " -- bursty-revoke", n, Mix.BURSTY_REVOKE, brLevels);
+        List<Result> results = new ArrayList<>();
+        for (Mix mix : new Mix[] {Mix.READ_HEAVY, Mix.BURSTY_REVOKE}) {
+            if (!MIXES.contains(mix.label())) continue;
+            System.out.println("\n-- offered-load sweep, " + mix.label());
+            List<Integer> admitted = sweepOperatingPoint(n, mix, levels, 250);
+            System.out.printf("%ncandidate operating point: %s %d ops/s (re-measured below)%n%n",
+                    mix.label(), admitted.get(admitted.size() - 1));
+            results.add(measureWithStepDown(label + " -- " + mix.label(), n, mix, admitted));
+        }
 
         System.out.println();
-        printTable(List.of(readHeavy, bursty));
-        writeResultsFile(List.of(readHeavy, bursty), n);
+        printTable(results);
+        writeResultsFile(results, n);
+        writeRowsTsv(results, n);
+        // The shared BFT-SMaRt client's netty threads are not daemons: without an explicit exit the
+        // JVM outlives the run, keeps its sessions open against the replicas, and the next
+        // invocation's clients collide with it.
+        System.out.flush();
+        System.exit(0);
     }
 
     /**
@@ -162,6 +225,9 @@ public final class Bench {
         System.out.println();
         printTable(results);
         writeEqualLoadFile(results, n);
+        writeRowsTsv(results, n);
+        System.out.flush();
+        System.exit(0);
     }
 
     /** Workload mixes of plan section 12.2 / Paper 2 section VIII-C. */
@@ -221,8 +287,36 @@ public final class Bench {
     static List<Integer> sweepOperatingPoint(int n, Mix mix, int[] levels, int batchSize)
             throws Exception {
         List<Integer> admitted = new ArrayList<>();
+        int saturatedAt = -1;
         for (int rate : levels) {
-            RunOutcome o = singleRun(n, mix, rate, batchSize);
+            if (!sweepLevel(n, mix, rate, batchSize)) { saturatedAt = rate; break; }
+            admitted.add(rate);
+        }
+        if (admitted.isEmpty()) {
+            throw new IllegalStateException("no offered load was sustained; lower the sweep levels "
+                    + "or give the harness more CPU -- reporting percentiles from a saturated "
+                    + "open-loop run would measure the queue, not the system");
+        }
+        // Bisect between the last sustained and the first saturated level.
+        int lo = admitted.get(admitted.size() - 1), hi = saturatedAt;
+        for (int step = 0; step < REFINE_STEPS && hi > 0; step++) {
+            int mid = roundLevel((lo + hi) / 2);
+            if (mid <= lo || mid >= hi || hi - lo <= Math.max(5, lo / 20)) break;
+            if (sweepLevel(n, mix, mid, batchSize)) { admitted.add(mid); lo = mid; } else { hi = mid; }
+        }
+        return admitted;
+    }
+
+    /** Rounds a refined level to 5 ops/s below 200, 25 below 2000, 50 above. */
+    static int roundLevel(int v) {
+        int q = v < 200 ? 5 : v < 2000 ? 25 : 50;
+        return Math.max(q, (v / q) * q);
+    }
+
+    /** One sweep run at one level: true if the schedule is kept within the p99 target. */
+    static boolean sweepLevel(int n, Mix mix, int rate, int batchSize) throws Exception {
+        {
+            RunOutcome o = singleRun(n, mix, rate, batchSize, SWEEP_WARMUP_MS, SWEEP_STEADY_MS);
             double p99 = o.hist.percentile(99);
             // Two admission criteria, both required.
             //  (1) the arrival schedule is kept: achieved within 5% of offered;
@@ -236,16 +330,11 @@ public final class Bench {
             boolean sustained = keepsSchedule && withinSlo;
             String verdict = sustained ? "sustained"
                     : (!keepsSchedule ? "SATURATED (throughput)" : "SATURATED (p99 past target)");
-            System.out.printf("    sweep: offered %6d ops/s -> achieved %8.0f ops/s  p99 %8.0f us  %s%n",
-                    rate, o.throughput, p99, verdict);
-            if (sustained) admitted.add(rate); else break;
+            System.out.printf("    sweep: offered %6d ops/s -> achieved %8.0f ops/s  p99 %8.0f us  %s%s%n",
+                    rate, o.throughput, p99, verdict,
+                    o.failures > 0 ? "  (" + o.failures + " failed ops)" : "");
+            return sustained;
         }
-        if (admitted.isEmpty()) {
-            throw new IllegalStateException("no offered load was sustained; lower the sweep levels "
-                    + "or give the harness more CPU -- reporting percentiles from a saturated "
-                    + "open-loop run would measure the queue, not the system");
-        }
-        return admitted;
     }
 
     /**
@@ -312,10 +401,12 @@ public final class Bench {
         int burstSize = 0;
         int batchSize = 250;
         String backendNotes = "";
+        long failures = 0;
 
         for (int run = 0; run < RUNS; run++) {
-            RunOutcome o = singleRun(n, mix, offeredRate, batchSize);
+            RunOutcome o = singleRun(n, mix, offeredRate, batchSize, WARMUP_MS, STEADY_MS);
             backendNotes = o.notes;
+            failures += o.failures;
             merged.merge(o.hist);
             perRunThroughput[run] = o.throughput;
             perRunResolve[run] = o.resolveThroughput;
@@ -340,7 +431,8 @@ public final class Bench {
 
         // The backend describes its own configuration. A hardcoded string here put "confidentiality
         // off, fast path Tier 0" on Hyperledger Indy rows, which have neither.
-        String notes = backendNotes;
+        String notes = String.format("offered %d ops/s, %d runs, %d failed ops; %s",
+                offeredRate, RUNS, failures, backendNotes);
 
         return new Result(name,
                 Histogram.mean(perRunThroughput), Histogram.ci95(perRunThroughput),
@@ -364,7 +456,7 @@ public final class Bench {
     record RunOutcome(Histogram hist, double throughput, double resolveThroughput,
                       double writeThroughput, double revokeThroughput,
                       Histogram burst, double burstDrainMs, int burstSize,
-                      long burstTxns, long burstTxnsConfirmed, String notes) {}
+                      long burstTxns, long burstTxnsConfirmed, String notes, long failures) {}
 
     /**
      * One run against whichever system {@link #BACKEND} names.
@@ -374,15 +466,15 @@ public final class Bench {
      * operating-point admission. Only what happens behind the {@link Backend} calls differs, which
      * is what makes the four rows of the evaluation matrix comparable to each other.
      */
-    static RunOutcome singleRun(int n, Mix mix, int offeredRate, int batchSize) throws Exception {
+    static RunOutcome singleRun(int n, Mix mix, int offeredRate, int batchSize,
+                                long warmupMs, long steadyMs) throws Exception {
         try (Backend backend = BACKEND.create(n, batchSize)) {
             try {
 
             // ---- population phase (not measured) ----------------------------------
             List<String> dids = backend.populate(DID_POOL);
 
-            ExecutorService pool = Executors.newFixedThreadPool(
-                    Math.max(4, Runtime.getRuntime().availableProcessors() * 8));
+            ExecutorService pool = newGeneratorPool();
             Histogram hist = new Histogram();
             AtomicLong committed = new AtomicLong();
             AtomicLong resolves = new AtomicLong(), writes = new AtomicLong(), revokes = new AtomicLong();
@@ -396,8 +488,8 @@ public final class Bench {
                     new java.util.concurrent.atomic.AtomicReference<>();
             AtomicLong steadyStart = new AtomicLong(Long.MAX_VALUE);
             long start = System.nanoTime();
-            long warmupEndNanos = start + WARMUP_MS * 1_000_000L;
-            long endNanos = warmupEndNanos + STEADY_MS * 1_000_000L;
+            long warmupEndNanos = start + warmupMs * 1_000_000L;
+            long endNanos = warmupEndNanos + steadyMs * 1_000_000L;
 
             // ---- open-loop arrival schedule: fixed inter-arrival interval, no back-pressure
             long intervalNanos = 1_000_000_000L / offeredRate;
@@ -407,12 +499,16 @@ public final class Bench {
             final int group = Math.max(1, offeredRate / 500);   // one park per ~2 ms
             long nextArrival = System.nanoTime();
             long opIndex = 0;
-            final long burstAt = warmupEndNanos + (STEADY_MS / 2) * 1_000_000L;
+            final long burstAt = warmupEndNanos + (steadyMs / 2) * 1_000_000L;
             boolean burstFired = false;
             final Histogram burstHist = new Histogram();
             final AtomicLong burstLastCommitNanos = new AtomicLong(0);
             final AtomicLong burstStartNanos = new AtomicLong(0);
             long txnsAtBurst = 0, confirmedAtBurst = 0;
+            // Updates go round-robin over the whole DID pool. Picking them by idx % DID_POOL (with
+            // DID_POOL a multiple of 100) sent every update to the same 16 DIDs, so successive
+            // rotations of one DID overlapped and conflicted on both systems.
+            long writeSeq = 0;
 
             while (System.nanoTime() < endNanos) {
                 long now = System.nanoTime();
@@ -443,18 +539,20 @@ public final class Bench {
                 }
 
                 int roll = (int) (idx % 100);
+                final boolean isWrite = roll >= mix.resolvePct && roll < mix.resolvePct + mix.writePct;
+                final int didIndex = isWrite ? (int) (writeSeq++ % DID_POOL) : (int) (idx % DID_POOL);
                 pool.execute(() -> {
                     try {
                         if (roll < mix.resolvePct) {
-                            String did = dids.get((int) (idx % DID_POOL));
+                            String did = dids.get(didIndex);
                             backend.resolve(did, (int) idx);
                             if (measured) { record(hist, scheduled); committed.incrementAndGet(); resolves.incrementAndGet(); }
-                        } else if (roll < mix.resolvePct + mix.writePct) {
-                            String did = dids.get((int) (idx % DID_POOL));
+                        } else if (isWrite) {
+                            String did = dids.get(didIndex);
                             backend.update(did, 1, docFor((int) idx));
                             if (measured) { record(hist, scheduled); committed.incrementAndGet(); writes.incrementAndGet(); }
                         } else {
-                            String did = dids.get((int) (idx % DID_POOL));
+                            String did = dids.get(didIndex);
                             backend.submitRevoke(backend.registryIdFor(did), handle(idx)).join();
                             if (measured) { record(hist, scheduled); committed.incrementAndGet(); revokes.incrementAndGet(); }
                         }
@@ -471,12 +569,15 @@ public final class Bench {
             }
             backend.flushRevocations();
             pool.shutdown();
-            pool.awaitTermination(60, TimeUnit.SECONDS);
+            if (!pool.awaitTermination(60, TimeUnit.SECONDS)) {
+                // A saturated level leaves a backlog; it must not bleed into the next run.
+                pool.shutdownNow();
+            }
 
             // The fixed arrival window. Dividing by wall time up to the last completion charges
             // the post-window drain — Indy's serial revocation chain, in-flight writes — against
             // the steady stream, and reports a system that kept the schedule as saturated.
-            double windowSeconds = STEADY_MS / 1000.0;
+            double windowSeconds = steadyMs / 1000.0;
             long failures = failedResolve.get() + failedWrite.get() + failedRevoke.get();
             if (failures > 0) {
                 System.out.printf("      failures: resolve %d, write %d, revoke %d (first: %s)%n",
@@ -496,7 +597,7 @@ public final class Bench {
                     resolves.get() / windowSeconds, writes.get() / windowSeconds,
                     revokes.get() / windowSeconds,
                     burstHist, drainMs, mix.burst ? BURST_SIZE : 0,
-                    burstTxns, burstConfirmed, backend.notes());
+                    burstTxns, burstConfirmed, backend.notes(), failures);
             } finally {
                 // backend closed by try-with-resources
             }
@@ -642,6 +743,25 @@ public final class Bench {
         appendPerOperation(sb, results);
         java.nio.file.Files.writeString(java.nio.file.Path.of("RESULTS.md"), sb.toString());
         System.out.println("\nwrote RESULTS.md (equal offered load)");
+    }
+
+    /**
+     * Machine-readable rows for deploy/vps/make-table.py: one line per measured configuration.
+     * Columns: name, throughput, ci95, p50_us, p95_us, p99_us, runs, warmup_ms, steady_ms, n, notes.
+     */
+    static void writeRowsTsv(List<Result> results, int n) throws Exception {
+        StringBuilder sb = new StringBuilder(
+                "name\tthroughput\tci95\tp50_us\tp95_us\tp99_us\truns\twarmup_ms\tsteady_ms\tn"
+                + "\tburst_drain_ms\tburst_p99_us\tnotes\n");
+        for (Result r : results) {
+            sb.append(String.format(java.util.Locale.ROOT,
+                    "%s\t%.1f\t%.1f\t%.0f\t%.0f\t%.0f\t%d\t%d\t%d\t%d\t%.0f\t%.0f\t%s%n",
+                    r.name, r.throughput, r.throughputCi, r.p50, r.p95, r.p99, RUNS, WARMUP_MS,
+                    STEADY_MS, n, r.burstDrainMs, r.burstP99Us,
+                    r.notes.replace('\t', ' ').replace('\n', ' ')));
+        }
+        java.nio.file.Files.writeString(java.nio.file.Path.of("rows.tsv"), sb.toString());
+        System.out.println("wrote rows.tsv");
     }
 
     static void appendRow(StringBuilder sb, Result r) {

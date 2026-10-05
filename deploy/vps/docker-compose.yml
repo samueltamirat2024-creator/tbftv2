@@ -67,6 +67,12 @@ x-vdr-replica: &vdr-replica
   volumes:
     - ../../config:/work/config:ro
   restart: unless-stopped
+  environment:
+    # The image compiled the module already; skip recompiling at every replica start.
+    VDR_SKIP_BUILD: "1"
+    # Heap pre-sized so a 1 vCPU replica does not spend the run resizing it (JVM ergonomics pick the
+    # serial collector on 1 vCPU). Override with REPLICA_JAVA_OPTS in .env.
+    VDR_REPLICA_JAVA_OPTS: ${REPLICA_JAVA_OPTS:--Xms512m -Xmx1g}
 
 services:
   node1:
@@ -179,6 +185,21 @@ services:
       - ../../config:/work/config:ro
     depends_on: [vdr-replica-0, vdr-replica-1, vdr-replica-2, vdr-replica-3]
 
+  # Measurement-only Tailored runner used by measure-table.sh: environment capture + vdr.bench.Bench
+  # against the four replicas above. No build, no simulator gates.
+  tailored-bench:
+    <<: *bench
+    profiles: [bftsmart]
+    cpus: ${BENCH_CPUS:-4}
+    cpuset: "${AUX_CPUSET:-}"
+    command: ["./deploy/vps/run-tailored.sh"]
+    environment:
+      VDR_BFTSMART_CONFIG: /work/config
+      RESULT_TAG: ${RESULT_TAG:-}
+    volumes:
+      - ./results/tailored-bft:/results
+      - ../../config:/work/config:ro
+
   # Indy baseline: probe, one-time registry setup, then the same vdr.bench.Bench harness.
   # The nofile limit comes from the shared x-bench anchor above.
   indy-bench:
@@ -192,6 +213,9 @@ services:
       GENESIS_URL: http://webserver:8000/genesis
       INDY_TRUSTEE_SEED: ${INDY_TRUSTEE_SEED:-000000000000000000000000Trustee1}
       INDY_ENTRIES_PER_TXN: ${INDY_ENTRIES_PER_TXN:-}
+      INDY_REGISTRY_COUNT: ${INDY_REGISTRY_COUNT:-40}
+      INDY_GENESIS_READY: ${INDY_GENESIS_READY:-0}
+      RESULT_TAG: ${RESULT_TAG:-}
     volumes:
       - ./results/indy:/results
     depends_on: [webserver]

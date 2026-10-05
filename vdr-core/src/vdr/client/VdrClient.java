@@ -110,7 +110,18 @@ public final class VdrClient {
      */
     public byte[] resolveTier0(String did, int nearestReplica) {
         Reply r = cluster.readTier0(did, nearestReplica);
-        if (!r.ok) return null;
+        if (!r.ok) {
+            // One replica's "not found" is not evidence: it may simply not have executed the
+            // register yet (writes commit at f+1, so up to 2f replicas can lag), or it may be lying.
+            // Returning null here let a single replica make a DID disappear. Ask f+1 instead.
+            tier0Fallbacks.increment();
+            return resolveTier1(did, nearestReplica);
+        }
+        if (!isTrustedRoot(r.checkpointRoot)) {
+            // The replica may simply be on a checkpoint cut after the client's last root refresh.
+            // Refresh once (f+1 agreement, shared among concurrent readers) and look again.
+            cluster.refreshTrustedRootNow();
+        }
         if (!isTrustedRoot(r.checkpointRoot)) {
             // An honest replica slightly ahead of (or too far behind) the f+1-agreed root is not a
             // forger. Same rule as Tier 1: a stale or early replica costs a fallback, never an answer.

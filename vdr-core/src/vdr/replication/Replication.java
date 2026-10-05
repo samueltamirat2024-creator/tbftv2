@@ -64,6 +64,16 @@ public interface Replication extends AutoCloseable {
     long trustedEpoch();
 
     /**
+     * Fetches the f+1-agreed root now instead of waiting for the next background refresh. Called by
+     * the client when a Tier-0 reply carries a root it does not (yet) trust: under revocation load
+     * every committed batch cuts a checkpoint (V6), so replica roots move every few tens of
+     * milliseconds, far faster than a periodic refresh. Concurrent callers share one refresh. The
+     * trust rule is unchanged -- a root is still believed only when f+1 replicas return it.
+     * No-op where roots are read from memory (the simulator).
+     */
+    default void refreshTrustedRootNow() { }
+
+    /**
      * True when the two synthetic latency constants are in play, so the harness can decide whether
      * RESULTS.md carries the provenance warning. Printing that warning on a real run would be as
      * misleading as omitting it on a simulated one.

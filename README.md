@@ -105,6 +105,19 @@ docs/              BFT-SMaRt wiring, deviations from the plan
 deploy/            Dockerfile, Compose stack, Helm skeleton, and the measurement protocol runner
 ```
 
+## Measuring the four-row table (4 nodes × 1 vCPU)
+
+```bash
+cd deploy/vps
+PROFILE=quick ./measure-table.sh     # pipeline check (~40 min)
+./measure-table.sh                   # Tailored BFT VDR and Indy, read-heavy and bursty-revoke
+```
+
+One server, four nodes each capped and pinned to one vCPU, one system at a time; writes
+`deploy/vps/results/table/<stamp>/TABLE.md`. See [`deploy/vps/MEASURE-TABLE.md`](deploy/vps/MEASURE-TABLE.md),
+and [`docs/OPTIMIZATIONS-2026-10.md`](docs/OPTIMIZATIONS-2026-10.md) for what changed in the code
+before it (including fixes that make earlier Tailored rows invalid).
+
 ## Running the measurement protocol
 
 `deploy/vps/run-protocol.sh` is the only entry point that gives both systems the same treatment —

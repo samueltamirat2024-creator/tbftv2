@@ -12,8 +12,13 @@ mkdir -p "$OUT"
 
 # ---------------------------------------------------------------- 1. pool readiness
 # The web server answers /genesis with 503 until it can reach the pool.
-echo "waiting for the pool at $GENESIS_URL"
 GENESIS=/results/pool_transactions_genesis
+# measure-table.sh fetches the genesis itself and then stops the ledger browser, so it does not
+# compete with the nodes for CPU during the measurement. INDY_GENESIS_READY=1 says the file is there.
+if [ "${INDY_GENESIS_READY:-0}" = "1" ] && [ -s "$GENESIS" ]; then
+  echo "using the genesis file already in /results"
+else
+echo "waiting for the pool at $GENESIS_URL"
 for _ in $(seq 1 60); do
   if curl -fsS "$GENESIS_URL" -o "$GENESIS.tmp" 2>/dev/null; then
     mv "$GENESIS.tmp" "$GENESIS"
@@ -21,6 +26,7 @@ for _ in $(seq 1 60); do
   fi
   sleep 5
 done
+fi
 [ -s "$GENESIS" ] || { echo "pool not ready after 5 minutes; check: docker compose logs" >&2; exit 1; }
 cp "$GENESIS" "$OUT/"
 export INDY_GENESIS="$GENESIS"
@@ -56,5 +62,8 @@ cp "$REGISTRY_ENV" "$OUT/"
 [ -n "${INDY_ENTRIES_PER_TXN:-}" ] || unset INDY_ENTRIES_PER_TXN
 ./indy-baseline/build.sh bench 4 2>&1 | tee "$OUT/bench.log"
 cp RESULTS.md "$OUT/RESULTS.md"
+[ -f rows.tsv ] && cp rows.tsv "$OUT/rows.tsv"
+# measure-table.sh looks for this to find the run it just started.
+[ -n "${RESULT_TAG:-}" ] && echo "$STAMP" > "/results/latest-$RESULT_TAG"
 
 echo "done. outputs in deploy/vps/results/indy/$STAMP"
