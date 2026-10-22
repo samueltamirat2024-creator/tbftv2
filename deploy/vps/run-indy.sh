@@ -61,6 +61,9 @@ cp "$REGISTRY_ENV" "$OUT/"
 # The pool has four nodes, so n is fixed at 4.
 [ -n "${INDY_ENTRIES_PER_TXN:-}" ] || unset INDY_ENTRIES_PER_TXN
 ./indy-baseline/build.sh bench 4 2>&1 | tee "$OUT/bench.log"
+# A sweep-only phase (measure-table.sh) measures nothing and writes no RESULTS.md; copying the
+# one already in /work would file a stale result under this run's stamp.
+[ "${BENCH_PHASE:-}" = sweep ] && { echo "sweep phase done. log in $OUT/bench.log"; exit 0; }
 cp RESULTS.md "$OUT/RESULTS.md"
 [ -f rows.tsv ] && cp rows.tsv "$OUT/rows.tsv"
 # measure-table.sh looks for this to find the run it just started.

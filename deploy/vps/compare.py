@@ -145,8 +145,10 @@ def burst_rows(label, tb, ib):
 def operating_points(t, i):
     print("| Mix | Metric | Tailored BFT | Indy | Tailored / Indy |")
     print("|---|---|---|---|---|")
-    for mix in ("read-heavy", "bursty-revoke"):
+    for mix in ("read-heavy", "bursty-revoke", "register", "update"):
         tr, ir = t["rows"].get(mix), i["rows"].get(mix)
+        if not tr and not ir and mix in ("register", "update"):
+            continue    # the write-only mixes are optional; measure-table.sh MIXES selects them
         if not tr or not ir:
             print(f"| {mix} | (missing in {'Tailored' if not tr else 'Indy'}) | | | |")
             continue
@@ -164,7 +166,8 @@ def operating_points(t, i):
 def equal_load(t, i):
     print("| Mix @ offered load | Metric | Tailored BFT | Indy | Tailored / Indy |")
     print("|---|---|---|---|---|")
-    for key in sorted(set(t["rows"]) | set(i["rows"]), key=lambda k: (k[0] != "read-heavy", k[1])):
+    order = {"read-heavy": 0, "bursty-revoke": 1, "register": 2, "update": 3}
+    for key in sorted(set(t["rows"]) | set(i["rows"]), key=lambda k: (order.get(k[0], 9), k[1])):
         mix, rate = key
         label = f"{mix} @ {rate}"
         tr, ir = t["rows"].get(key), i["rows"].get(key)

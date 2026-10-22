@@ -17,8 +17,11 @@ public interface BackendFactory {
     /** Row label for this system in the evaluation matrix. */
     String displayName();
 
-    /** Rows this run cannot fill, printed as "not measured" so the matrix shape stays visible. */
-    List<String> rowsNotMeasuredHere();
+    /**
+     * Rows this run cannot fill, one per measured mix label, printed as "not measured" so the
+     * matrix shape stays visible.
+     */
+    List<String> rowsNotMeasuredHere(List<String> mixes);
 
     /**
      * True when this run's numbers come from the simulated ordering layer, so RESULTS.md carries
@@ -68,9 +71,8 @@ public interface BackendFactory {
                 return "Tailored BFT VDR";
             }
 
-            @Override public List<String> rowsNotMeasuredHere() {
-                return List.of("Hyperledger Indy -- read-heavy",
-                        "Hyperledger Indy -- bursty-revoke");
+            @Override public List<String> rowsNotMeasuredHere(List<String> mixes) {
+                return mixes.stream().map(m -> "Hyperledger Indy -- " + m).toList();
             }
 
             @Override public boolean usesSimulatedReplication() {
@@ -101,9 +103,8 @@ public interface BackendFactory {
                 return "Hyperledger Indy";
             }
 
-            @Override public List<String> rowsNotMeasuredHere() {
-                return List.of("Tailored BFT VDR -- read-heavy",
-                        "Tailored BFT VDR -- bursty-revoke");
+            @Override public List<String> rowsNotMeasuredHere(List<String> mixes) {
+                return mixes.stream().map(m -> "Tailored BFT VDR -- " + m).toList();
             }
         };
     }

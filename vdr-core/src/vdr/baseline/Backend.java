@@ -40,6 +40,13 @@ public interface Backend extends AutoCloseable {
      */
     List<String> populate(int count) throws Exception;
 
+    /**
+     * A DID name never written to this ledger or cluster, for a measured {@link #register}. Both
+     * systems' state outlives a run, so a reused name would be denied (Tailored P1_DID_EXISTS) or
+     * be an unauthorised edit (Indy), and either would be a failed write, not a measured one.
+     */
+    String freshDid(long seq);
+
     /** Ordered write. Returns when committed by the definition above. */
     void register(String did, byte[] document) throws Exception;
 
@@ -82,6 +89,16 @@ public interface Backend extends AutoCloseable {
      * Tailored BFT VDR, a distinct ledger seqNo in the pool's reply for Indy. -1 if unknown.
      */
     default long revocationTransactionsConfirmed() {
+        return -1;
+    }
+
+    /**
+     * Updates that had to wait for another in-flight update of the same DID. Both backends
+     * serialise updates per DID, so a non-zero count means the update stream's rate x latency
+     * exceeded the DID pool and the generator, not the system, caused part of the latency.
+     * -1 if unknown.
+     */
+    default long contendedUpdates() {
         return -1;
     }
 

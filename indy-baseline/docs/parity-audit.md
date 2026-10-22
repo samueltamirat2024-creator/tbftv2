@@ -68,3 +68,26 @@ JIT on ours, connection pool and catch-up on Indy — but the *treatment* is ide
 discarded prefix, same absence of outlier discarding, same merged-histogram percentiles.
 
 - [ ] Confirmed identical in `bench/METRICS.md` terms.
+
+## 8. Register and Update as measured operations
+
+The `register` and `update` mixes (`vdr.bench.Bench.Mix.REGISTER` / `UPDATE`) put every arrival on
+one write path, so how far the two writes actually match decides what those rows mean.
+
+| | Tailored BFT VDR | Hyperledger Indy |
+|---|---|---|
+| register | DepSpace `cas` of a new DID record, signed by the bench issuer, committed at f+1 matching replies | NYM create, signed by the trustee (ENDORSER-or-better submitter), committed on an accepted pool reply |
+| update | append-only versioned update against the DID's current version (P3 optimistic concurrency), signed by the controller key | NYM verkey rotation, signed by the DID's *current* key; the next update is signed by the new one |
+| payload | the full DID document (~150 bytes) is stored and covered by the checkpoint root | NYM carries the DID and verkey only; the bench document bytes are not written |
+| write batching | gateway / BFT-SMaRt batch, `maxBatchDelay` = 50 ms | `Max3PCBatchSize` = 100, `Max3PCBatchWait` = 0.05 s |
+| per-DID serialisation | one in-flight update per DID | one in-flight update per DID |
+| fresh names | `freshDid` uses the backend's per-run namespace | `freshDid` uses the backend's per-process salt |
+
+- [ ] Stated in the paper: the Tailored update stores a whole document version, while the Indy
+      update rotates one key. Indy writes fewer bytes per update, and that favours the baseline.
+- [ ] Stated: Indy signs every register with one trustee and Tailored with one issuer. Neither
+      side spreads registers over several submitters.
+- [ ] `contendedUpdates 0` in every reported update row on both systems, so update latency
+      excludes waits on the generator's own per-DID locks (raise `UPDATE_DID_POOL` if not).
+- [ ] The same 500 ms p99 admission target as the read rows. It is a read SLO (Paper 2 §III),
+      applied unchanged so that every row follows one rule.

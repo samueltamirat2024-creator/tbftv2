@@ -8,6 +8,10 @@
 #   ./run-protocol.sh equal-load indy           both mixes at FIXED offered loads (no sweep), so
 #   ./run-protocol.sh equal-load tailored-bft   latency is compared at the same load on both
 #
+#   MIXES=read-heavy,bursty-revoke,register,update ./run-protocol.sh indy
+#                                   adds the two VDR write operations (register, update) as
+#                                   single-operation mixes; give both systems the same MIXES
+#
 # WHAT THIS ENFORCES
 #   - both systems get the same warm-up, steady window and run count (the defaults in Bench)
 #   - Indy gets a fresh revocation registry per run, from a pool reset beforehand
@@ -50,6 +54,23 @@ fi
 INDY_LEVELS="10,20,50,60,65,70,75,100,125,150,175,200,225,250"
 TAILORED_LEVELS="250,500,750,1000,1250,1500,1750,2000,2250,2500,2750,3000,4000"
 
+# Which mixes Bench measures (comma-separated). The default is the original two; add register and
+# update for the write-operation rows. Their knees sit far below read-heavy's, so they sweep
+# their own levels (-Dbench.levels.<mix>).
+MIXES="${MIXES:-read-heavy,bursty-revoke}"
+INDY_WRITE_LEVELS="${INDY_WRITE_LEVELS:-5,10,25,50,75,100,125,150,200}"
+TAILORED_WRITE_LEVELS="${TAILORED_WRITE_LEVELS:-50,100,250,500,750,1000,1500,2000,3000}"
+UPDATE_DID_POOL="${UPDATE_DID_POOL:-400}"
+NMIXES=$(tr ',' '\n' <<<"$MIXES" | grep -c .)
+has_mix() { [[ ",$MIXES," == *",$1,"* ]]; }
+write_levels() {          # write_levels <indy|tailored>: per-mix level flags for the write mixes
+  local l; [ "$1" = indy ] && l="$INDY_WRITE_LEVELS" || l="$TAILORED_WRITE_LEVELS"
+  has_mix register && printf ' -Dbench.levels.register=%s' "$l"
+  has_mix update && printf ' -Dbench.levels.update=%s' "$l"
+  return 0
+}
+MIX_FLAGS="-Dbench.mixes=$MIXES -Dbench.didPool=$UPDATE_DID_POOL"
+
 # The batching delay must match on both sides. Different delays manufacture a speed-up.
 BATCH_DELAY_MS="${VDR_MAX_BATCH_DELAY_MS:-50}"
 
@@ -57,18 +78,28 @@ BATCH_DELAY_MS="${VDR_MAX_BATCH_DELAY_MS:-50}"
 # ~50 ops/s, so 200 ops/s there would compare Tailored with Indy's queue. Override per mix.
 EQ_READ_HEAVY="${EQ_READ_HEAVY:-50,200}"
 EQ_BURSTY="${EQ_BURSTY:-25,50}"
+EQ_REGISTER="${EQ_REGISTER:-10,25,50}"
+EQ_UPDATE="${EQ_UPDATE:-10,25,50}"
 
 # Indy takes one fresh revocation registry per sweep level and per measured run. Worst case for
 # the full protocol: 14 levels x 2 mixes + 10 runs x 2 mixes + two step-downs per mix (40) = 88.
 # Equal load: 4 levels x 10 runs = 40. Too few and the run dies mid-way on an exhausted pool.
+# Every Indy backend takes a registry whatever the mix, so the count scales with the mixes.
 if [ "$EQUAL" = "1" ]; then
-  INDY_REGISTRIES="${INDY_REGISTRY_COUNT:-50}"
-  LEVEL_FLAGS="-Dbench.equalLoad.readHeavy=$EQ_READ_HEAVY -Dbench.equalLoad.burstyRevoke=$EQ_BURSTY"
-  LABEL="$LABEL, equal offered load (read-heavy $EQ_READ_HEAVY, bursty-revoke $EQ_BURSTY ops/s)"
-else
-  INDY_REGISTRIES="${INDY_REGISTRY_COUNT:-100}"
+  INDY_REGISTRIES="${INDY_REGISTRY_COUNT:-$(( 25 * NMIXES ))}"
   LEVEL_FLAGS=""
+  has_mix read-heavy && LEVEL_FLAGS="$LEVEL_FLAGS -Dbench.equalLoad.readHeavy=$EQ_READ_HEAVY"
+  has_mix bursty-revoke && LEVEL_FLAGS="$LEVEL_FLAGS -Dbench.equalLoad.burstyRevoke=$EQ_BURSTY"
+  has_mix register && LEVEL_FLAGS="$LEVEL_FLAGS -Dbench.equalLoad.register=$EQ_REGISTER"
+  has_mix update && LEVEL_FLAGS="$LEVEL_FLAGS -Dbench.equalLoad.update=$EQ_UPDATE"
+  LABEL="$LABEL, equal offered load ($LEVEL_FLAGS)"
+  INDY_MIX_LEVELS=""; TAILORED_MIX_LEVELS=""
+else
+  INDY_REGISTRIES="${INDY_REGISTRY_COUNT:-$(( 50 * NMIXES ))}"
+  LEVEL_FLAGS=""
+  INDY_MIX_LEVELS="$(write_levels indy)"; TAILORED_MIX_LEVELS="$(write_levels tailored)"
 fi
+LABEL="$LABEL, mixes $MIXES"
 
 if [ -z "${TMUX:-}" ]; then
   echo "NOTE: not inside tmux. A full run takes hours and a dropped connection kills it."
@@ -87,16 +118,16 @@ case "$SYSTEM" in
       echo "resetting the pool so every run starts on a clean registry"
       ./reset-pool.sh "$INDY_REGISTRIES"
     fi
-    docker compose run --rm -e JAVA_TOOL_OPTIONS="$SETTINGS $LEVEL_FLAGS \
+    docker compose run --rm -e JAVA_TOOL_OPTIONS="$SETTINGS $LEVEL_FLAGS $MIX_FLAGS \
         -Dindy.maxBatchDelayMs=$BATCH_DELAY_MS \
-        -Dbench.levels=$INDY_LEVELS" indy-bench
+        -Dbench.levels=$INDY_LEVELS$INDY_MIX_LEVELS" indy-bench
     ;;
   tailored)
     echo "WARNING: the simulated ordering layer is in use. These numbers validate the pipeline;"
     echo "         they are not results. Use 'tailored-bft' once the cluster is up."
-    docker compose run --rm -e JAVA_TOOL_OPTIONS="$SETTINGS $LEVEL_FLAGS \
+    docker compose run --rm -e JAVA_TOOL_OPTIONS="$SETTINGS $LEVEL_FLAGS $MIX_FLAGS \
         -Dvdr.maxBatchDelayMs=$BATCH_DELAY_MS \
-        -Dbench.levels=$TAILORED_LEVELS" tailored
+        -Dbench.levels=$TAILORED_LEVELS$TAILORED_MIX_LEVELS" tailored
     ;;
   tailored-bft)
     # Per-replica keys are generated on this machine and never shipped (git, image). Without them
@@ -118,8 +149,8 @@ case "$SYSTEM" in
     docker compose --profile bftsmart up -d vdr-replica-0 vdr-replica-1 vdr-replica-2 vdr-replica-3
     sleep 20                      # replicas need to find each other before the first request
     docker compose --profile bftsmart run --rm \
-        -e JAVA_TOOL_OPTIONS="$SETTINGS $LEVEL_FLAGS -Dvdr.maxBatchDelayMs=$BATCH_DELAY_MS \
-            -Dbench.levels=$TAILORED_LEVELS" \
+        -e JAVA_TOOL_OPTIONS="$SETTINGS $LEVEL_FLAGS $MIX_FLAGS -Dvdr.maxBatchDelayMs=$BATCH_DELAY_MS \
+            -Dbench.levels=$TAILORED_LEVELS$TAILORED_MIX_LEVELS" \
         tailored-bft
     ;;
   *)

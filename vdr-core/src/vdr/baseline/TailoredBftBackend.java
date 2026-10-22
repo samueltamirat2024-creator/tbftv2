@@ -46,6 +46,12 @@ public final class TailoredBftBackend implements Backend {
     private final ConcurrentHashMap<String, long[]> versions = new ConcurrentHashMap<>();
     /** One in-flight update per DID: a controller does not race its own key rotation. */
     private final ConcurrentHashMap<String, ReentrantLock> didLocks = new ConcurrentHashMap<>();
+    /**
+     * Updates that found their DID's lock held. Non-zero means the update mix's rate x latency
+     * exceeded the DID pool, and part of the measured latency is a wait the generator caused.
+     */
+    private final java.util.concurrent.atomic.LongAdder contendedUpdates =
+            new java.util.concurrent.atomic.LongAdder();
 
     /** Distinct client ids across concurrently live backends: BFT-SMaRt keys its session by id. */
     private static final java.util.concurrent.atomic.AtomicInteger CLIENT_IDS =
@@ -116,9 +122,20 @@ public final class TailoredBftBackend implements Backend {
 
     @Override public String notes() {
         return String.format("n=%d (f=%d), confidentiality off, fast path Tier 0, batchSize=%d, "
-                + "maxBatchDelay=%d ms, %s, client Ed25519 %s, Tier-0 fallbacks %d",
+                + "maxBatchDelay=%d ms, %s, client Ed25519 %s, Tier-0 fallbacks %d, "
+                + "contendedUpdates %d",
                 cluster.n(), cluster.f(), batchSize, maxBatchDelayMillis, cluster.describe(),
-                vdr.crypto.Crypto.ed25519Provider(), issuer.tier0Fallbacks.sum());
+                vdr.crypto.Crypto.ed25519Provider(), issuer.tier0Fallbacks.sum(),
+                contendedUpdates.sum());
+    }
+
+    @Override public long contendedUpdates() {
+        return contendedUpdates.sum();
+    }
+
+    @Override public String freshDid(long seq) {
+        // The "-r" infix keeps measured registers apart from the population's names.
+        return "did:vdr:bench-" + namespace + "-r" + seq;
     }
 
     @Override public List<String> populate(int count) {
@@ -161,7 +178,10 @@ public final class TailoredBftBackend implements Backend {
      */
     @Override public void update(String did, long expectedVersion, byte[] document) {
         ReentrantLock lock = didLocks.computeIfAbsent(did, k -> new ReentrantLock());
-        lock.lock();
+        if (!lock.tryLock()) {
+            contendedUpdates.increment();
+            lock.lock();
+        }
         try {
             long[] v = versions.computeIfAbsent(did, k -> new long[] {expectedVersion});
             VdrClient.Outcome o = issuer.update(did, v[0], document, issuer.publicKey());

@@ -332,9 +332,9 @@ public final class IndyBackend implements Backend {
         return String.format("n=%d, %d revoked indices per "
                 + "REVOC_REG_ENTRY or %d ms (swept optimum), serial accumulator chain, "
                 + "fresh registry per run (%d revoked at open), client config %s, indy-vdr %s, "
-                + "client Ed25519 %s",
+                + "client Ed25519 %s, contendedUpdates %d",
                 nodeCount, entriesPerTransaction, maxBatchDelayMs, Math.max(revokedAtOpen, 0),
-                poolConfig, vdr.version(), Crypto.ed25519Provider());
+                poolConfig, vdr.version(), Crypto.ed25519Provider(), contendedUpdates.sum());
     }
 
     /**
@@ -376,7 +376,10 @@ public final class IndyBackend implements Backend {
         // both be signed with the same current key and the second would be rejected by the pool.
         java.util.concurrent.locks.ReentrantLock lock =
                 didLocks.computeIfAbsent(did, k -> new java.util.concurrent.locks.ReentrantLock());
-        lock.lock();
+        if (!lock.tryLock()) {
+            contendedUpdates.increment();
+            lock.lock();
+        }
         try {
             Identity current = identities.get(did);
             if (current == null) {
@@ -396,6 +399,19 @@ public final class IndyBackend implements Backend {
 
     private final ConcurrentHashMap<String, java.util.concurrent.locks.ReentrantLock> didLocks =
             new ConcurrentHashMap<>();
+    /** Updates that found their DID's lock held; see TailoredBftBackend.contendedUpdates. */
+    private final java.util.concurrent.atomic.LongAdder contendedUpdates =
+            new java.util.concurrent.atomic.LongAdder();
+
+    @Override public long contendedUpdates() {
+        return contendedUpdates.sum();
+    }
+
+    @Override public String freshDid(long seq) {
+        // Bench-facing name only: register() derives the Indy identity from salt + ":reg:" + this,
+        // and the salt is per process, so the name is fresh on a ledger that outlives the run.
+        return "bench-reg-" + salt + "-" + seq;
+    }
 
     @Override public void resolve(String did, int replicaHint) throws Exception {
         Identity id = identities.get(did);

@@ -47,6 +47,7 @@ public final class Gates {
         bSnapshotRestoresIdenticalRoot();
         bSnapshotExcludesPerReplicaState();
         bIncrementalCheckpointEqualsScratch();
+        bRegisterAndUpdateMixes();
 
         System.out.println("=".repeat(78));
         System.out.printf("passed %d, failed %d%n", passed, failed);
@@ -625,6 +626,68 @@ public final class Gates {
                 restored.installIdenticalProjection(s0.serialiseIdenticalProjection());
                 check(Arrays.equals(restored.checkpoint().root, s0.checkpoint().root),
                         "restored checkpoint root differs from the source's");
+            }
+        });
+    }
+
+    /**
+     * Register and Update measured as operations of their own. A register that reused a name, or
+     * an update against a stale version, is DENIED; the harness must book that as a failure, and
+     * the single-operation mixes are only meaningful if neither happens on a healthy cluster. The
+     * per-operation histograms must partition the mix histogram, or the per-op latency table
+     * describes different samples from the row it sits under.
+     */
+    private static void bRegisterAndUpdateMixes() {
+        gate("B6", "Do every mix's shares sum to 100, and do the write-only mixes run clean?", () -> {
+            for (vdr.bench.Bench.Mix m : vdr.bench.Bench.Mix.values()) {
+                check(m.totalPct() == 100, m.label() + " sums to " + m.totalPct() + "%, not 100%");
+            }
+            check(vdr.bench.Bench.Mix.REGISTER.opFor(0) == vdr.bench.Bench.OpType.REGISTER
+                    && vdr.bench.Bench.Mix.REGISTER.opFor(99) == vdr.bench.Bench.OpType.REGISTER,
+                    "the register mix issues something other than registers");
+            check(vdr.bench.Bench.Mix.UPDATE.opFor(0) == vdr.bench.Bench.OpType.UPDATE
+                    && vdr.bench.Bench.Mix.UPDATE.opFor(99) == vdr.bench.Bench.OpType.UPDATE,
+                    "the update mix issues something other than updates");
+
+            try (vdr.baseline.Backend b = new vdr.baseline.TailoredBftBackend(4, 250, 50)) {
+                List<String> pop = b.populate(4);
+                Set<String> fresh = new HashSet<>();
+                for (int i = 0; i < 50; i++) {
+                    String did = b.freshDid(i);
+                    check(fresh.add(did) && !pop.contains(did),
+                            "freshDid(" + i + ") repeats a name already written: " + did);
+                    b.register(did, ("{\"id\":\"" + did + "\"}").getBytes());
+                }
+                for (String did : fresh) b.resolve(did, 0);    // throws if not resolvable
+                // Successive updates of one DID: each must be applied against the version the
+                // previous one committed, never DENIED as a P3 conflict.
+                for (int i = 0; i < 5; i++) b.update(pop.get(0), 1, ("{\"v\":" + i + "}").getBytes());
+                check(b.contendedUpdates() == 0, "serial updates were reported as contended");
+            } catch (Exception e) {
+                throw new AssertionError("register/update on the simulator failed: " + e, e);
+            }
+
+            for (vdr.bench.Bench.Mix m : List.of(vdr.bench.Bench.Mix.REGISTER,
+                    vdr.bench.Bench.Mix.UPDATE, vdr.bench.Bench.Mix.BALANCED)) {
+                vdr.bench.Bench.RunOutcome o;
+                try {
+                    o = vdr.bench.Bench.singleRun(4, m, 100, 250, 300, 1500);
+                } catch (Exception e) {
+                    throw new AssertionError(m.label() + " run failed: " + e, e);
+                }
+                check(o.failures() == 0, m.label() + ": " + o.failures() + " failed operations");
+                long split = 0;
+                for (vdr.bench.Histogram h : o.opHist()) split += h.count();
+                check(o.hist().count() > 0, m.label() + ": nothing committed in the window");
+                check(split == o.hist().count(), m.label() + ": per-operation histograms hold "
+                        + split + " samples, the mix histogram " + o.hist().count());
+                for (vdr.bench.Bench.OpType t : vdr.bench.Bench.OpType.values()) {
+                    boolean issued = java.util.stream.IntStream.range(0, 100)
+                            .anyMatch(r -> m.opFor(r) == t);
+                    long got = o.opHist()[t.ordinal()].count();
+                    check(issued == (got > 0), m.label() + ": " + t.label() + " has " + got
+                            + " samples but " + (issued ? "is" : "is not") + " in the mix");
+                }
             }
         });
     }
