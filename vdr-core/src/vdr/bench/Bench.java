@@ -372,6 +372,8 @@ public final class Bench {
      * @param burstTxns ordered revocation operations the burst cost, mean per run (-1 if the
      *     backend cannot say)
      * @param burstTxnsConfirmed of those, how many the system acknowledged, mean per run
+     * @param burstDrainCi 95% confidence half-width of the per-run drain times
+     * @param burstP50Us burst p50 / p95 from the burst's merged histogram (as burstP99Us)
      */
     /**
      * @param writeTput register + update ops/s (the combined column of earlier tables)
@@ -381,7 +383,8 @@ public final class Bench {
                   double p50, double p95, double p99, String notes,
                   double resolveTput, double writeTput, double revokeTput,
                   double burstDrainMs, double burstP99Us, int burstSize,
-                  double burstTxns, double burstTxnsConfirmed, List<OpStats> perOp) {
+                  double burstTxns, double burstTxnsConfirmed, List<OpStats> perOp,
+                  double burstDrainCi, double burstP50Us, double burstP95Us) {
 
         /** Without burst transaction counts or per-operation stats (gate B2 builds rows this way). */
         public Result(String name, double throughput, double throughputCi,
@@ -389,13 +392,13 @@ public final class Bench {
                       double resolveTput, double writeTput, double revokeTput,
                       double burstDrainMs, double burstP99Us, int burstSize) {
             this(name, throughput, throughputCi, p50, p95, p99, notes, resolveTput, writeTput,
-                    revokeTput, burstDrainMs, burstP99Us, burstSize, -1, -1, List.of());
+                    revokeTput, burstDrainMs, burstP99Us, burstSize, -1, -1, List.of(), 0, 0, 0);
         }
 
         Result withNotes(String newNotes) {
             return new Result(name, throughput, throughputCi, p50, p95, p99, newNotes,
                     resolveTput, writeTput, revokeTput, burstDrainMs, burstP99Us, burstSize,
-                    burstTxns, burstTxnsConfirmed, perOp);
+                    burstTxns, burstTxnsConfirmed, perOp, burstDrainCi, burstP50Us, burstP95Us);
         }
 
         /** The stats for one operation, or null if it never committed in this configuration. */
@@ -649,7 +652,8 @@ public final class Bench {
                 Histogram.mean(perRunOp[OpType.RESOLVE.ordinal()]), Histogram.mean(perRunWrite),
                 Histogram.mean(perRunOp[OpType.REVOKE.ordinal()]),
                 Histogram.mean(perRunDrain), mergedBurst.percentile(99), burstSize,
-                Histogram.mean(perRunBurstTxns), Histogram.mean(perRunBurstConfirmed), perOp);
+                Histogram.mean(perRunBurstTxns), Histogram.mean(perRunBurstConfirmed), perOp,
+                Histogram.ci95(perRunDrain), mergedBurst.percentile(50), mergedBurst.percentile(95));
     }
 
     /**
@@ -1017,14 +1021,16 @@ public final class Bench {
     /**
      * Machine-readable rows for deploy/vps/make-table.py: one line per measured configuration.
      * Columns: name, throughput, ci95, p50_us, p95_us, p99_us, runs, warmup_ms, steady_ms, n,
-     * burst_drain_ms, burst_p99_us, then &lt;op&gt;_tput / &lt;op&gt;_p50_us / &lt;op&gt;_p95_us /
+     * burst_drain_ms, burst_p99_us, burst_size, burst_drain_ci_ms, burst_p50_us, burst_p95_us,
+     * burst_txns, burst_txns_confirmed (-1 when the backend cannot count them), then &lt;op&gt;_tput / &lt;op&gt;_p50_us / &lt;op&gt;_p95_us /
      * &lt;op&gt;_p99_us for resolve, register, update, revoke (empty if the op never committed),
      * then notes, which stays last.
      */
     static void writeRowsTsv(List<Result> results, int n) throws Exception {
         StringBuilder sb = new StringBuilder(
                 "name\tthroughput\tci95\tp50_us\tp95_us\tp99_us\truns\twarmup_ms\tsteady_ms\tn"
-                + "\tburst_drain_ms\tburst_p99_us");
+                + "\tburst_drain_ms\tburst_p99_us\tburst_size\tburst_drain_ci_ms\tburst_p50_us"
+                + "\tburst_p95_us\tburst_txns\tburst_txns_confirmed");
         for (OpType t : OpType.values()) {
             String k = t.label();
             sb.append('\t').append(k).append("_tput\t").append(k).append("_p50_us\t")
@@ -1033,9 +1039,11 @@ public final class Bench {
         sb.append("\tnotes\n");
         for (Result r : results) {
             sb.append(String.format(java.util.Locale.ROOT,
-                    "%s\t%.1f\t%.1f\t%.0f\t%.0f\t%.0f\t%d\t%d\t%d\t%d\t%.0f\t%.0f",
+                    "%s\t%.1f\t%.1f\t%.0f\t%.0f\t%.0f\t%d\t%d\t%d\t%d\t%.0f\t%.0f\t%d\t%.1f\t%.0f\t%.0f"
+                    + "\t%.1f\t%.1f",
                     r.name, r.throughput, r.throughputCi, r.p50, r.p95, r.p99, RUNS, WARMUP_MS,
-                    STEADY_MS, n, r.burstDrainMs, r.burstP99Us));
+                    STEADY_MS, n, r.burstDrainMs, r.burstP99Us, r.burstSize, r.burstDrainCi,
+                    r.burstP50Us, r.burstP95Us, r.burstTxns, r.burstTxnsConfirmed));
             for (OpType t : OpType.values()) {
                 OpStats o = r.op(t);
                 sb.append(o == null ? "\t\t\t\t" : String.format(java.util.Locale.ROOT,
@@ -1058,10 +1066,12 @@ public final class Bench {
         sb.append("\n**Revoke burst")
           .append(r.name.contains(" @ ") ? " (" + r.name + ")" : "").append(".** ").append(r.burstSize)
           .append(" revocations drained in ").append(String.format("%.0f", r.burstDrainMs))
+          .append(String.format(" ± %.0f", r.burstDrainCi))
           .append(" ms (").append(String.format("%.0f", r.burstDrainMs > 0
                 ? r.burstSize / (r.burstDrainMs / 1000.0) : 0))
           .append(" revokes/s), burst p99 ").append(String.format("%.0f", r.burstP99Us))
-          .append(" \u00b5s. Burst arrivals share one injection instant, so they are\n")
+          .append(String.format(" \u00b5s (p50 %.0f \u00b5s, p95 %.0f \u00b5s)", r.burstP50Us, r.burstP95Us))
+          .append(". Burst arrivals share one injection instant, so they are\n")
           .append("reported here rather than folded into the steady-mix percentiles above.\n");
         if (r.burstTxns >= 0) {
             // The drain is a per-BATCH cost: both systems aggregate revocations before ordering

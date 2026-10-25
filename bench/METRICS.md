@@ -78,7 +78,13 @@ reported separately from the steady-mix percentiles:
 
 - **burst drain time**: injection to last burst revocation committing;
 - **burst throughput**: revocations per second across the drain;
-- **burst p99**: from the burst's own merged histogram.
+- **burst p50 / p95 / p99**: from the burst's own histogram merged over all runs;
+- **drain-time 95% CI**: half-width over the per-run drain times;
+- **burst cost**: ordered revocation transactions submitted from injection to the end of the run
+  (and how many were confirmed), i.e. how many consensus instances the burst became.
+
+`make-table.py` reports these as a separate analysis section of `TABLE.md` ("Revocation burst"),
+Tailored next to Indy.
 
 Folding them into the mix histogram would make every percentile in the row describe the burst
 backlog rather than the system serving the steady stream. The plan's metric for the burst is

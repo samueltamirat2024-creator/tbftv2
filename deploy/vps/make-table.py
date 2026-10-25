@@ -5,10 +5,12 @@ Build the comparison tables from the rows.tsv files vdr.bench.Bench writes.
     python3 make-table.py --tailored T.tsv --indy I.tsv [--profile standard] [--cpus 4]
     python3 make-table.py ... --equal-load      # rows are "<mix> @ <rate> ops/s"
 
-Three tables:
+Four tables:
   1. every configuration (system x mix), as before;
   2. Register and Update, Tailored next to Indy, with ratios;
-  3. per-operation latency of the writes inside the mixed workloads.
+  3. per-operation latency of the writes inside the mixed workloads;
+  4. the revocation burst (800 revocations at one instant inside bursty-revoke), Tailored next
+     to Indy, with ratios.
 
 Missing inputs leave their rows as "not measured", so a one-system run still prints the tables.
 Latency is reported in milliseconds; the harness records microseconds.
@@ -49,6 +51,12 @@ def num(row, col):
     return float(v) if v.strip() else None
 
 
+def burst_size(row):
+    """Revocations in the burst; rows.tsv files before the burst_size column used 800."""
+    n = num(row, "burst_size")
+    return int(n) if n else 800
+
+
 def ratio(a, b):
     return f"{a / b:.3g}x" if a is not None and b else "—"
 
@@ -72,7 +80,7 @@ def short_notes(row, mix):
     if m:
         parts.append(f"{m.group(1)} contended updates (raise UPDATE_DID_POOL)")
     if mix == "bursty-revoke" and float(row.get("burst_drain_ms", 0) or 0) > 0:
-        parts.append(f"800-revocation burst drained in {float(row['burst_drain_ms']):.0f} ms "
+        parts.append(f"{burst_size(row)}-revocation burst drained in {float(row['burst_drain_ms']):.0f} ms "
                      f"(burst p99 {ms(row['burst_p99_us'])} ms)")
     m = re.search(r"Ed25519 ([^,;]+)", notes)
     if m:
@@ -166,6 +174,83 @@ def mixed_write_latency(data, mixes, equal):
           "so register appears only in its own mix.")
 
 
+def burst_table(data, mixes, equal):
+    """The revocation burst as an experiment of its own: drain, burst latency and batching cost."""
+    if "bursty-revoke" not in mixes:
+        return
+    keys = keys_for(data, "bursty-revoke", equal) or [("bursty-revoke", None)]
+    rows = []
+
+    def add(label, metric, t, i, fmt, with_ratio=True):
+        cell = lambda v: "—" if v is None else fmt(v)
+        rows.append(f"| {label} | {metric} | {cell(t)} | {cell(i)} | "
+                    f"{ratio(t, i) if with_ratio else '—'} |")
+
+    for k in keys:
+        t, i = data["tailored"].get(k), data["indy"].get(k)
+        fired = [r for r in (t, i) if r and (num(r, "burst_drain_ms") or 0) > 0]
+        if not fired:
+            continue
+        label = label_of(*k)
+        b = lambda r, c: num(r, c) if r and (num(r, "burst_drain_ms") or 0) > 0 else None
+
+        def offered(r):
+            m = re.search(r"offered (\d+) ops/s", (r or {}).get("notes", ""))
+            return float(m.group(1)) if m else None
+
+        def drain_cell(r):
+            d, ci = b(r, "burst_drain_ms"), b(r, "burst_drain_ci_ms")
+            return None if d is None else (d, ci)
+
+        td, idr = drain_cell(t), drain_cell(i)
+        rows.append(f"| {label} | burst size (revocations) | "
+                    f"{burst_size(t) if td else '—'} | {burst_size(i) if idr else '—'} | — |")
+        add(label, "steady offered load around the burst (ops/s)", offered(t), offered(i),
+            lambda v: f"{v:.0f}", False)
+        fmt_drain = lambda c: "—" if c is None else (
+            f"{c[0]:.0f} ± {c[1]:.0f}" if c[1] is not None else f"{c[0]:.0f}")
+        rows.append(f"| {label} | drain time, injection to last commit (ms) | {fmt_drain(td)} | "
+                    f"{fmt_drain(idr)} | {ratio(td and td[0], idr and idr[0])} |")
+        rate = lambda r, c: burst_size(r) / (c[0] / 1000.0) if c else None
+        add(label, "drain throughput (revocations/s)", rate(t, td), rate(i, idr),
+            lambda v: f"{v:.0f}")
+        for p in ("p50", "p95", "p99"):
+            add(label, f"burst {p} latency (ms)", b(t, f"burst_{p}_us"), b(i, f"burst_{p}_us"), ms)
+
+        def txns(r):
+            v = b(r, "burst_txns")
+            return v if v is not None and v >= 0 else None
+        tt, it = txns(t), txns(i)
+        conf = lambda r, v: "—" if v is None else f"{v:.1f} ({b(r, 'burst_txns_confirmed'):.1f})"
+        rows.append(f"| {label} | ordered revocation transactions (confirmed) | {conf(t, tt)} | "
+                    f"{conf(i, it)} | {ratio(tt, it)} |")
+        add(label, "revocations per ordered transaction",
+            burst_size(t) / tt if tt else None, burst_size(i) / it if it else None,
+            lambda v: f"{v:.0f}")
+        add(label, "steady-stream p99 in the same runs (ms)",
+            num(t, "p99_us"), num(i, "p99_us"), ms)
+    if not rows:
+        return
+    print("\n## Revocation burst — 800 revocations injected at one instant\n")
+    print("Inside every bursty-revoke run, halfway through the steady window, the generator submits "
+          "the whole burst at a single instant on top of the steady stream (incident response: one "
+          "issuer revoking many credentials at once). Burst latency is measured from that instant, "
+          "so it includes queueing behind the rest of the burst; it is kept out of the steady-mix "
+          "percentiles above. Drain time is the mean over runs ± its 95% confidence half-width; "
+          "burst percentiles come from the burst's histogram merged over all runs. Both systems "
+          "aggregate revocations before ordering them (same batching delay), so the transaction "
+          "rows show what the burst cost in consensus instances.\n")
+    if not equal:
+        print("Each system carries the burst on top of its OWN steady operating point (row 2), so "
+              "the steady background load differs; run EQUAL_LOAD=1 for the same background load.\n")
+    print("| Load | Metric | Tailored BFT VDR | Hyperledger Indy | Tailored / Indy |")
+    print("|---|---|---|---|---|")
+    print("\n".join(rows))
+    print("\nRatios < 1x for time, latency and transaction count, and > 1x for revocations/s and "
+          "revocations per transaction, favour the Tailored BFT VDR. A dash means not measured, or "
+          "(transactions) that the backend cannot count them.")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tailored")
@@ -196,6 +281,7 @@ def main():
     main_table(data, mixes, a.equal_load)
     writes_table(data, mixes, a.equal_load)
     mixed_write_latency(data, mixes, a.equal_load)
+    burst_table(data, mixes, a.equal_load)
     if a.profile == "quick":
         print("\n> PROFILE=quick: short windows and 3 runs. Use these to check the pipeline, not as "
               "results. Re-run with PROFILE=standard or full.")

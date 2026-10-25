@@ -27,7 +27,7 @@ ROW = re.compile(r"^\|\s*(?:Tailored BFT VDR|Hyperledger Indy) -- (?P<mix>[\w-]+
 EQ_ROW = re.compile(r"^\|\s*(?:Tailored BFT VDR|Hyperledger Indy) -- (?P<mix>[\w-]+) "
                     r"@ (?P<rate>\d+) ops/s\s*\|" + COLS)
 BURST = re.compile(r"(?:\(\D*-- bursty-revoke @ (?P<rate>\d+) ops/s\)\.\*\* )?"
-                   r"(?P<size>\d+) revocations drained in (?P<drain>-?\d+) ms \((?P<rps>\d+) "
+                   r"(?P<size>\d+) revocations drained in (?P<drain>-?\d+)(?: ± \d+)? ms \((?P<rps>\d+) "
                    r"revokes/s\), burst p99 (?P<p99>\d+)")
 BURST_COST = re.compile(r"Burst cost: ([\d.-]+) ordered revocation transactions per run "
                         r"\(([\d.-]+) confirmed\)")

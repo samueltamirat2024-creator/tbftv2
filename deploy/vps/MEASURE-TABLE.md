@@ -13,10 +13,16 @@ Hyperledger Indy baseline — update
 ```
 
 `measure-table.sh` measures these rows and writes them to `results/table/<UTC stamp>/TABLE.md`.
-`TABLE.md` holds three tables:
+`TABLE.md` holds four tables:
 - every row above;
 - **Register and Update**, Tailored next to Indy with ratios;
-- the per-operation latency of updates inside the two mixed workloads.
+- the per-operation latency of updates inside the two mixed workloads;
+- **Revocation burst**, an experiment of its own: 800 revocations submitted at one instant halfway
+  through each bursty-revoke run, on top of the steady stream. Tailored next to Indy with ratios:
+  drain time (mean ± 95% CI), drain throughput, burst p50 / p95 / p99 measured from the injection
+  instant, ordered revocation transactions the burst became (and revocations per transaction),
+  and the steady stream's p99 in the same runs. With `EQUAL_LOAD=1` it is one block per
+  bursty-revoke rate, so both systems carry the burst on the same background load.
 
 The two VDR write operations each have a mix of their own:
 - `register`: every arrival writes a fresh DID. On Tailored this is a DepSpace `cas`; on Indy, a
@@ -134,7 +140,7 @@ remaining cores (e.g. 8 vCPU: nodes on 0–3, generator on 4–7).
 
 ```
 results/table/<stamp>/
-  TABLE.md                  the four rows
+  TABLE.md                  the rows, Register/Update, writes in the mixes, revocation burst
   measure.log               everything the run printed
   tailored-RESULTS.md       full Tailored harness output (sweep path, burst, per-operation split)
   tailored-environment.txt  jars, BFT-SMaRt config, CPU, JVM
