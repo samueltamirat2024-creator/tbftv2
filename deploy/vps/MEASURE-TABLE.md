@@ -1,15 +1,37 @@
-# Measuring the four-row table on one 4 vCPU server
+# Measuring the comparison table on one 4 vCPU server
 
 ```
 Configuration                              Throughput (ops/s)   p50 / p95 / p99 latency
 Tailored BFT VDR — read-heavy
 Tailored BFT VDR — bursty-revoke
+Tailored BFT VDR — register
+Tailored BFT VDR — update
 Hyperledger Indy baseline — read-heavy
 Hyperledger Indy baseline — bursty-revoke
+Hyperledger Indy baseline — register
+Hyperledger Indy baseline — update
 ```
 
-`measure-table.sh` measures exactly these four rows, nothing else, and writes them to
-`results/table/<UTC stamp>/TABLE.md`.
+`measure-table.sh` measures these rows and writes them to `results/table/<UTC stamp>/TABLE.md`.
+`TABLE.md` holds four tables:
+- every row above;
+- **Register and Update**, Tailored next to Indy with ratios;
+- the per-operation latency of updates inside the two mixed workloads;
+- **Revocation burst**, an experiment of its own: 800 revocations submitted at one instant halfway
+  through each bursty-revoke run, on top of the steady stream. Tailored next to Indy with ratios:
+  drain time (mean ± 95% CI), drain throughput, burst p50 / p95 / p99 measured from the injection
+  instant, ordered revocation transactions the burst became (and revocations per transaction),
+  and the steady stream's p99 in the same runs. With `EQUAL_LOAD=1` it is one block per
+  bursty-revoke rate, so both systems carry the burst on the same background load.
+
+The two VDR write operations each have a mix of their own:
+- `register`: every arrival writes a fresh DID. On Tailored this is a DepSpace `cas`; on Indy, a
+  trustee NYM.
+- `update`: every arrival rotates the key of a pre-populated DID. On Tailored this is a versioned
+  update; on Indy, a NYM verkey rotation signed by the DID's own key.
+
+They use the same definitions as the other rows (`bench/METRICS.md`, "Register and Update mixes").
+See `indy-baseline/docs/parity-audit.md` §8 for where the two write paths differ.
 
 ## 1. Server
 
@@ -49,9 +71,24 @@ Detach with `Ctrl-b d`, re-attach with `tmux attach -t bench`.
 | `standard` | 15 s / 30 s | 60 s / 60 s | 5 | default |
 | `full` | 60 s / 60 s | 60 s / 60 s | 10 | the paper's stated protocol |
 
-Other knobs: `SYSTEMS=tailored` or `SYSTEMS=indy` (one system only), `TAILORED_LEVELS=...`,
-`INDY_LEVELS=...` (comma-separated sweep levels), `VDR_MAX_BATCH_DELAY_MS` (default 50, applied
-to both systems).
+Other knobs:
+- `SYSTEMS=tailored` or `SYSTEMS=indy`: one system only.
+- `MIXES="register update"`: a subset of `read-heavy bursty-revoke register update`.
+- `TAILORED_LEVELS=...`, `INDY_LEVELS=...`: comma-separated sweep levels for the mixed workloads.
+- `TAILORED_WRITE_LEVELS=...`, `INDY_WRITE_LEVELS=...`: sweep levels for `register` and `update`.
+- `UPDATE_DID_POOL` (default 400): the DIDs the update mix rotates over. Raise it if a row reports
+  contended updates.
+- `VDR_MAX_BATCH_DELAY_MS` (default 50): applied to both systems.
+
+**Equal offered load.** `EQUAL_LOAD=1 ./measure-table.sh` skips the sweep and measures every mix on
+both systems at the same fixed rates: `EQ_READ_HEAVY` (50,100,200), `EQ_BURSTY_REVOKE` (25,50),
+`EQ_REGISTER` (10,25,50) and `EQ_UPDATE` (10,25,50). Choose rates that both systems sustain. A row
+marked SATURATED measures a queue.
+
+```bash
+MIXES="register update" ./measure-table.sh                # each system at its own knee
+EQUAL_LOAD=1 MIXES="register update" ./measure-table.sh   # both systems at the same loads
+```
 
 ## 4. What the script does
 
@@ -62,16 +99,34 @@ to both systems).
 3. **Tailored BFT VDR**: stops the Indy pool, starts four fresh replicas, waits until every
    replica has authenticated channels to the other three (BFT-SMaRt 1.2 occasionally fails one
    key exchange at startup; such a cluster is recreated, never measured), then runs
-   `vdr.bench.Bench` for both mixes.
+   `vdr.bench.Bench` for each mix (see below).
 4. **Indy**: wipes the ledger, starts the four validators, fetches the genesis file, **stops the
    ledger browser** (it would otherwise compete for CPU), mints one fresh revocation registry per
-   run, and runs the same `vdr.bench.Bench` for both mixes.
+   run, and runs the same `vdr.bench.Bench` for each mix.
 5. Merges the two `rows.tsv` files into `TABLE.md`.
 
-For each mix the harness sweeps the offered load, bisects the knee (`bench.refine`), then
-re-measures the highest level whose schedule is kept and whose **merged** p99 is within 500 ms,
-stepping down if the full runs miss it. Throughput is committed operations per second at that
-level; latency percentiles come from the merged histogram of all runs at that level.
+For each mix:
+1. **Sweep** (its own invocation, `-Dbench.sweepOnly`). The harness sweeps the offered load on
+   fresh state, bisects the knee (`bench.refine`), and lists every level whose schedule is kept and
+   whose p99 is within 500 ms.
+2. **Measure on fresh state.** The highest admitted level is measured with the full `RUNS`, on a
+   newly started cluster (Tailored) or a wiped ledger (Indy), in a new JVM. If its **merged** p99
+   misses 500 ms (exit 3), the next level down is measured, again on fresh state. Every level tried
+   is recorded in the row's admission path.
+
+Throughput is committed operations per second at the reported level. Latency percentiles come
+from the merged histogram of all runs at that level.
+
+**Why fresh state per measured level.** The sweep deliberately pushes the system past its knee.
+On a real 4-replica BFT-SMaRt cluster, measuring the operating point afterwards on the same cluster
+and client measured that damage. Update at 500 ops/s dropped to 0–42 ops/s after a sweep, but held
+500 ops/s with p99 15 ms on a fresh cluster. `FRESH_MEASURE=0` restores the old single-invocation
+protocol, where the sweep and the measurement share one cluster. Use it only to reproduce older
+tables.
+
+**In-flight bound.** A level with more than 1 s of arrivals in flight is stopped early and marked
+saturated (`bench/METRICS.md`, coordinated omission §2). Without that bound, a write-only mix past
+its knee would exhaust the generator's threads.
 
 ## 5. The one compromise on a 4 vCPU server
 
@@ -85,7 +140,7 @@ remaining cores (e.g. 8 vCPU: nodes on 0–3, generator on 4–7).
 
 ```
 results/table/<stamp>/
-  TABLE.md                  the four rows
+  TABLE.md                  the rows, Register/Update, writes in the mixes, revocation burst
   measure.log               everything the run printed
   tailored-RESULTS.md       full Tailored harness output (sweep path, burst, per-operation split)
   tailored-environment.txt  jars, BFT-SMaRt config, CPU, JVM
@@ -101,4 +156,6 @@ results/table/<stamp>/
 | `replica startup handshake incomplete` three times | `docker compose --profile bftsmart logs vdr-replica-0`; usually a stale `config/currentView` — delete it and retry. |
 | `pool not ready after 20 min` | `docker compose logs webserver node1`; confirm the host is x86-64. |
 | `no unused registry left` | Raise `INDY_REGISTRY_COUNT` (default is computed from the levels and runs). |
+| `stopped early: N operations in flight > bound` | That sweep level is past the knee. This is expected, and the level counts as saturated. If it happens at the *reported* level (`OVERLOADED` in the notes), lower the levels. |
+| `N contended updates` in a row's notes | Raise `UPDATE_DID_POOL`, for example to 1000. |
 | `Ed25519: JDK (bcprov not fetched)` | The image could not reach Maven Central. Runs still work; signatures cost ~1 ms instead of ~0.05 ms, and every row's notes say which was used. |

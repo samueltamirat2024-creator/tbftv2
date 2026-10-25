@@ -12,7 +12,7 @@ Committed operations per second, counted **at the client** on receipt of the f+1
 reply. A write is committed when the client can act on it, not when a replica logs it.
 
 - Steady-state window only. Warm-up and ramp-down are excluded.
-- Reported separately for `resolve`, `register`/`update` and `revoke`, plus the mix aggregate.
+- Reported separately for `resolve`, `register`, `update` and `revoke`, plus the mix aggregate.
 - A failed operation is not a committed operation: it is excluded from throughput and from the
   latency histogram, and never counted as a success.
 
@@ -32,7 +32,7 @@ The load generator is **open-loop** with a fixed arrival schedule and never wait
 before issuing the next request. Closed-loop generators hide queueing delay and would flatter the
 tail. Non-negotiable for p99 credibility (plan §12.1, risk register §15).
 
-Two consequences the harness enforces:
+Three consequences the harness enforces:
 
 1. **Operating-point admission.** A load level is reported only if it both keeps the arrival
    schedule (achieved ≥ 95% of offered) and stays inside the p99 target Paper 2 §III sets for the
@@ -40,7 +40,22 @@ Two consequences the harness enforces:
    generator can keep up on count while a backlog builds, and the percentiles then describe the
    queue rather than the system. If no level qualifies the harness raises rather than reporting a
    saturated run.
-2. **No generator-induced blocking.** The revoke burst is submitted to the gateway without a
+2. **In-flight bound.** The generator runs one thread per in-flight operation. If more than
+   rate × 2 × `P99_TARGET_US` operations (1 s worth of arrivals) are in flight at once, the
+   run stops early and is marked saturated. This bound applies from the start of the steady
+   window. During warm-up, which is discarded, only the absolute thread cap below applies, so a
+   backlog that builds while the system is cold and then drains does not end the run. By Little's law, mean latency is already past 1 s at
+   that point, so the level could not have met the 500 ms p99 target. Stopping it changes no
+   admission decision. It only keeps a write-only mix past its knee from exhausting the JVM's
+   threads. A reported row that was stopped this way says `OVERLOADED`, and its p99 is
+   reported as a lower bound of 2 × the target. The early stop never interrupts the operations
+   still in flight; they drain first, so the shared BFT-SMaRt client is never left in a broken
+   state. `-Dbench.maxInFlight` caps the bound so the generator stays inside the process thread
+   limit. An ordered write holds two threads, so the default is 800 on macOS (2048 threads per
+   process) and 4000 elsewhere. Above `maxInFlight` / 0.5 s of offered load, the cap no
+   longer implies a missed target, and a level stopped there is reported as NOT MEASURABLE, not
+   saturated. Raise the cap before reporting a knee above that load.
+3. **No generator-induced blocking.** The revoke burst is submitted to the gateway without a
    thread per revocation. A blocking join per item would occupy the generator's pool and the
    steady stream's latency would measure thread starvation in the harness.
 
@@ -63,12 +78,43 @@ reported separately from the steady-mix percentiles:
 
 - **burst drain time**: injection to last burst revocation committing;
 - **burst throughput**: revocations per second across the drain;
-- **burst p99**: from the burst's own merged histogram.
+- **burst p50 / p95 / p99**: from the burst's own histogram merged over all runs;
+- **drain-time 95% CI**: half-width over the per-run drain times;
+- **burst cost**: ordered revocation transactions submitted from injection to the end of the run
+  (and how many were confirmed), i.e. how many consensus instances the burst became.
+
+`make-table.py` reports these as a separate analysis section of `TABLE.md` ("Revocation burst"),
+Tailored next to Indy.
 
 Folding them into the mix histogram would make every percentile in the row describe the burst
 backlog rather than the system serving the steady stream. The plan's metric for the burst is
 throughput bounded by batch size rather than consensus round count (§3.4), which is what the drain
 numbers measure.
+
+## Register and Update mixes
+
+Added after the read-heavy and bursty-revoke definitions were frozen. These are new definitions;
+no existing one changes. They need the same sign-off as the rest of this file before any
+register/update number is collected.
+
+- **`register`**: every arrival registers a DID that has never been written (`Backend.freshDid`).
+  A register is committed at the f+1-th matching OK reply (Tailored) or an accepted NYM reply
+  (Indy). A DENIED register (for example a name collision) is a failure, not a commit.
+- **`update`**: every arrival is a key-rotation update of a DID from the pre-populated pool,
+  taken round-robin. It is committed by the same rule as a register. Updates of one DID are
+  serialised on both systems. Any update that waited for another update of the same DID is
+  counted (`contendedUpdates`), and a reported row must show 0.
+- **Throughput** for these rows is that operation's committed ops/s in the steady window.
+  **Latency** is that operation's merged histogram, which for a single-operation mix is the
+  row's histogram.
+- **Admission** is the same as for every other row: the schedule is kept (≥ 95% of offered) and
+  the merged p99 is ≤ `P99_TARGET_US` (500 ms).
+- **Equal load**: `-Dbench.equalLoad.register` / `-Dbench.equalLoad.update` measure both systems
+  at the same offered rates, with no sweep.
+- **Per-operation latency inside mixed workloads**: every committed operation is recorded in
+  the mix histogram *and* in its own operation's histogram, with one timestamp, so the
+  per-operation histograms partition the mix histogram exactly (gate B6). Per-operation
+  percentiles are read from per-operation histograms merged across runs, never averaged.
 
 ## Statistical protocol
 

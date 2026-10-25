@@ -31,6 +31,9 @@ CONFIG="${VDR_BFTSMART_CONFIG:-/work/config}"
 
 VDR_SKIP_BUILD=1 VDR_BFTSMART_CONFIG="$CONFIG" ./vdr-bftsmart/build.sh bench 4 2>&1 \
   | grep -v '^-- ' | tee "$OUT/bench.log"
+# A sweep-only phase (measure-table.sh) measures nothing and writes no RESULTS.md; copying the
+# one already in /work would file a stale result under this run's stamp.
+[ "${BENCH_PHASE:-}" = sweep ] && { echo "sweep phase done. log in $OUT/bench.log"; exit 0; }
 cp RESULTS.md "$OUT/RESULTS.md"
 cp rows.tsv "$OUT/rows.tsv"
 [ -n "${RESULT_TAG:-}" ] && echo "$STAMP" > "/results/latest-$RESULT_TAG"

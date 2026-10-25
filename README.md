@@ -105,12 +105,14 @@ docs/              BFT-SMaRt wiring, deviations from the plan
 deploy/            Dockerfile, Compose stack, Helm skeleton, and the measurement protocol runner
 ```
 
-## Measuring the four-row table (4 nodes × 1 vCPU)
+## Measuring the comparison table (4 nodes × 1 vCPU)
 
 ```bash
 cd deploy/vps
-PROFILE=quick ./measure-table.sh     # pipeline check (~40 min)
-./measure-table.sh                   # Tailored BFT VDR and Indy, read-heavy and bursty-revoke
+PROFILE=quick ./measure-table.sh     # pipeline check
+./measure-table.sh                   # Tailored BFT VDR and Indy: read-heavy, bursty-revoke, register, update
+MIXES="register update" ./measure-table.sh                # only the two VDR write operations
+EQUAL_LOAD=1 MIXES="register update" ./measure-table.sh   # same offered load on both systems
 ```
 
 One server, four nodes each capped and pinned to one vCPU, one system at a time; writes
@@ -130,6 +132,10 @@ cd deploy/vps
 ./run-protocol.sh indy           # Hyperledger Indy baseline
 ./run-protocol.sh tailored-bft   # Tailored BFT VDR on BFT-SMaRt
 python3 compare.py               # merge the two into one table
+
+# add the two VDR write operations (same MIXES on both systems)
+MIXES=read-heavy,bursty-revoke,register,update ./run-protocol.sh indy
+MIXES=read-heavy,bursty-revoke,register,update ./run-protocol.sh tailored-bft
 ```
 
 ## Indy baseline
