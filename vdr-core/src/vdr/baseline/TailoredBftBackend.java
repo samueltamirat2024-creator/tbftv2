@@ -122,7 +122,7 @@ public final class TailoredBftBackend implements Backend {
 
     @Override public String notes() {
         return String.format("n=%d (f=%d), confidentiality off, fast path Tier 0, batchSize=%d, "
-                + "maxBatchDelay=%d ms, %s, client Ed25519 %s, Tier-0 fallbacks %d, "
+                + "maxBatchDelay=%d ms, %s, client Ed25519 %s, Tier-0 fallbacks %d (last run, incl. warm-up), "
                 + "contendedUpdates %d",
                 cluster.n(), cluster.f(), batchSize, maxBatchDelayMillis, cluster.describe(),
                 vdr.crypto.Crypto.ed25519Provider(), issuer.tier0Fallbacks.sum(),
@@ -131,6 +131,14 @@ public final class TailoredBftBackend implements Backend {
 
     @Override public long contendedUpdates() {
         return contendedUpdates.sum();
+    }
+
+    @Override public long tier0Reads() {
+        return issuer.tier0Reads.sum();
+    }
+
+    @Override public long tier0Fallbacks() {
+        return issuer.tier0Fallbacks.sum();
     }
 
     @Override public String freshDid(long seq) {

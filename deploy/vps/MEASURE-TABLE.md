@@ -16,7 +16,10 @@ Hyperledger Indy baseline — update
 `TABLE.md` holds four tables:
 - every row above;
 - **Register and Update**, Tailored next to Indy with ratios;
-- the per-operation latency of updates inside the two mixed workloads;
+- the per-operation latency of updates and revocations inside the two mixed workloads
+  (read-heavy = 95% resolve / 4% update / 1% revoke; bursty-revoke = 90% resolve / 10% update);
+- the **Tier-0 fallback rate** of the Tailored BFT VDR in the mixed workloads, F of N reads over
+  the measured windows of all runs (`bench/METRICS.md`, "Tier-0 fallback rate");
 - **Revocation burst**, an experiment of its own: 800 revocations submitted at one instant halfway
   through each bursty-revoke run, on top of the steady stream. Tailored next to Indy with ratios:
   drain time (mean ± 95% CI), drain throughput, burst p50 / p95 / p99 measured from the injection
@@ -108,11 +111,17 @@ EQUAL_LOAD=1 MIXES="register update" ./measure-table.sh   # both systems at the 
 For each mix:
 1. **Sweep** (its own invocation, `-Dbench.sweepOnly`). The harness sweeps the offered load on
    fresh state, bisects the knee (`bench.refine`), and lists every level whose schedule is kept and
-   whose p99 is within 500 ms.
+   whose p99 is within 500 ms. It also prints the lowest level it failed (`SATURATED_AT`); the
+   script saves the sweep lines to `<system>-<mix>-sweep.txt` and passes the ceiling to the
+   measuring invocation (`-Dbench.sweepCeiling`).
 2. **Measure on fresh state.** The highest admitted level is measured with the full `RUNS`, on a
    newly started cluster (Tailored) or a wiped ledger (Indy), in a new JVM. If its **merged** p99
    misses 500 ms (exit 3), the next level down is measured, again on fresh state. Every level tried
    is recorded in the row's admission path.
+
+Each row's notes and `TABLE.md` then bracket the knee: `knee in (R, C]`, where C is the lowest
+level that failed. A row is a lower bound only if no listed level failed, or if the generator's
+in-flight cap rather than the system stopped it (`bench/METRICS.md`, "Knee bracket").
 
 Throughput is committed operations per second at the reported level. Latency percentiles come
 from the merged histogram of all runs at that level.
@@ -140,11 +149,13 @@ remaining cores (e.g. 8 vCPU: nodes on 0–3, generator on 4–7).
 
 ```
 results/table/<stamp>/
-  TABLE.md                  the rows, Register/Update, writes in the mixes, revocation burst
+  TABLE.md                  the rows (with knee brackets), Register/Update, writes in the mixes,
+                            Tier-0 fallbacks, revocation burst
   measure.log               everything the run printed
-  tailored-RESULTS.md       full Tailored harness output (sweep path, burst, per-operation split)
+  tailored-<mix>-RESULTS.md full Tailored harness output (sweep path, burst, per-operation split)
   tailored-environment.txt  jars, BFT-SMaRt config, CPU, JVM
-  indy-RESULTS.md           full Indy harness output
+  indy-<mix>-RESULTS.md     full Indy harness output
+  <system>-<mix>-sweep.txt  every sweep level and its verdict (the evidence for the knee bracket)
   replica-logs/, indy-node-logs/
 ```
 

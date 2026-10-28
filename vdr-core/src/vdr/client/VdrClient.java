@@ -39,6 +39,9 @@ public final class VdrClient {
     /** Tier-0 reads that fell back because the replica's root was not (yet) agreed. Report it. */
     public final java.util.concurrent.atomic.LongAdder tier0Fallbacks =
             new java.util.concurrent.atomic.LongAdder();
+    /** Tier-0 reads attempted: the denominator of the fallback rate. */
+    public final java.util.concurrent.atomic.LongAdder tier0Reads =
+            new java.util.concurrent.atomic.LongAdder();
 
     public VdrClient(Replication cluster, String clientId, KeyPair keys) {
         this.cluster = cluster;
@@ -109,6 +112,7 @@ public final class VdrClient {
      * stale-but-valid document from an older checkpoint (plan section 3.3).
      */
     public byte[] resolveTier0(String did, int nearestReplica) {
+        tier0Reads.increment();
         Reply r = cluster.readTier0(did, nearestReplica);
         if (!r.ok) {
             // One replica's "not found" is not evidence: it may simply not have executed the

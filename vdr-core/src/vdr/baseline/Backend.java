@@ -102,6 +102,19 @@ public interface Backend extends AutoCloseable {
         return -1;
     }
 
+    /**
+     * Tier-0 (single-replica, proof-verified) reads attempted so far, and of those, how many fell
+     * back to Tier 1/2 because the reply's root was not (yet) f+1-agreed or the replica denied the
+     * read. -1 if the system has no Tier-0 path (Indy).
+     */
+    default long tier0Reads() {
+        return -1;
+    }
+
+    default long tier0Fallbacks() {
+        return -1;
+    }
+
     @Override
     void close() throws Exception;
 }

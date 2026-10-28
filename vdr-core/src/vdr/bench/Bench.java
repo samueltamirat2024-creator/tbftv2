@@ -214,14 +214,18 @@ public final class Bench {
             // measure-table.sh therefore sweeps in one invocation and measures every level on a
             // fresh cluster / ledger in another.
             List<Integer> admitted = levelsProperty("bench.admitted." + mix.propertyKey());
+            // -Dbench.sweepCeiling: what that separate sweep found above the admitted levels.
+            Sweep ceiling = SWEEP_CEILING.isEmpty() ? null : Sweep.parse(SWEEP_CEILING);
             if (admitted.isEmpty()) {
                 System.out.println("\n-- offered-load sweep, " + mix.label()
                         + (own.isEmpty() ? "" : " (levels " + own + ")"));
-                admitted = sweepOperatingPoint(n, mix, mixLevels, 250);
+                ceiling = sweepOperatingPoint(n, mix, mixLevels, 250);
+                admitted = ceiling.admitted();
                 if (SWEEP_ONLY) {
-                    // The line measure-table.sh reads; nothing is measured in this invocation.
+                    // The lines measure-table.sh reads; nothing is measured in this invocation.
                     System.out.println("ADMITTED " + mix.label() + " " + admitted.stream()
                             .map(String::valueOf).collect(java.util.stream.Collectors.joining(",")));
+                    System.out.println("SATURATED_AT " + mix.label() + " " + ceiling.compact());
                     continue;
                 }
                 System.out.printf("%ncandidate operating point: %s %d ops/s (re-measured below)%n%n",
@@ -231,7 +235,8 @@ public final class Bench {
                         mix.label(), admitted);
             }
             try {
-                results.add(measureWithStepDown(label + " -- " + mix.label(), n, mix, admitted));
+                Result r = measureWithStepDown(label + " -- " + mix.label(), n, mix, admitted);
+                results.add(ceiling == null ? r : r.withNotes(r.notes() + "; " + ceiling.note()));
             } catch (NoLevelMetTarget e) {
                 // Exit 3 tells measure-table.sh to step down on a FRESH cluster, carrying the path.
                 System.out.println("STEPDOWN_PATH " + e.compactPath);
@@ -313,8 +318,9 @@ public final class Bench {
 
     /**
      * Workload mixes of plan section 12.2 / Paper 2 section VIII-C, plus one single-operation mix
-     * per write. The mixed workloads' compositions are unchanged from the rows already reported:
-     * their write share is updates only.
+     * per write. The mixed workloads' compositions are unchanged from the rows already reported,
+     * and neither registers: read-heavy is 95% resolve / 4% update / 1% revoke; bursty-revoke is
+     * 90% resolve / 10% update plus the {@link #BURST_SIZE}-revocation burst.
      */
     public enum Mix {
         READ_HEAVY(95, 0, 4, 1, false),     // steady-state verification
@@ -374,6 +380,9 @@ public final class Bench {
      * @param burstTxnsConfirmed of those, how many the system acknowledged, mean per run
      * @param burstDrainCi 95% confidence half-width of the per-run drain times
      * @param burstP50Us burst p50 / p95 from the burst's merged histogram (as burstP99Us)
+     * @param tier0Reads Tier-0 reads attempted in the measured windows, summed over all runs (-1
+     *     if the system has no Tier-0 path)
+     * @param tier0Fallbacks of those, how many fell back to Tier 1/2 (-1 likewise)
      */
     /**
      * @param writeTput register + update ops/s (the combined column of earlier tables)
@@ -384,7 +393,8 @@ public final class Bench {
                   double resolveTput, double writeTput, double revokeTput,
                   double burstDrainMs, double burstP99Us, int burstSize,
                   double burstTxns, double burstTxnsConfirmed, List<OpStats> perOp,
-                  double burstDrainCi, double burstP50Us, double burstP95Us) {
+                  double burstDrainCi, double burstP50Us, double burstP95Us,
+                  long tier0Reads, long tier0Fallbacks) {
 
         /** Without burst transaction counts or per-operation stats (gate B2 builds rows this way). */
         public Result(String name, double throughput, double throughputCi,
@@ -392,13 +402,15 @@ public final class Bench {
                       double resolveTput, double writeTput, double revokeTput,
                       double burstDrainMs, double burstP99Us, int burstSize) {
             this(name, throughput, throughputCi, p50, p95, p99, notes, resolveTput, writeTput,
-                    revokeTput, burstDrainMs, burstP99Us, burstSize, -1, -1, List.of(), 0, 0, 0);
+                    revokeTput, burstDrainMs, burstP99Us, burstSize, -1, -1, List.of(), 0, 0, 0,
+                    -1, -1);
         }
 
         Result withNotes(String newNotes) {
             return new Result(name, throughput, throughputCi, p50, p95, p99, newNotes,
                     resolveTput, writeTput, revokeTput, burstDrainMs, burstP99Us, burstSize,
-                    burstTxns, burstTxnsConfirmed, perOp, burstDrainCi, burstP50Us, burstP95Us);
+                    burstTxns, burstTxnsConfirmed, perOp, burstDrainCi, burstP50Us, burstP95Us,
+                    tier0Reads, tier0Fallbacks);
         }
 
         /** The stats for one operation, or null if it never committed in this configuration. */
@@ -411,16 +423,50 @@ public final class Bench {
     // ------------------------------------------------------------------ driver
 
     /**
-     * Offered-load sweep (plan section 12.2: each mix at multiple load levels).
-     * Returns EVERY level the system sustained, lowest first, because the sweep admits a level
-     * from a single run and that is not enough to report it -- see {@link #measureWithStepDown}.
+     * What a sweep found: EVERY level the system sustained, lowest first, and the lowest level it
+     * did not (-1 if every listed level passed, which makes the operating point a lower bound).
+     *
+     * @param ceilingVerdict why the ceiling failed: throughput, p99, inflight or generator
+     * @param maxListed the highest level the sweep was given
      */
-    static List<Integer> sweepOperatingPoint(int n, Mix mix, int[] levels, int batchSize)
+    public record Sweep(List<Integer> admitted, int ceiling, String ceilingVerdict, int maxListed) {
+
+        /** "200:throughput:600" or "none:-:600"; travels through JAVA_TOOL_OPTIONS, so no spaces. */
+        public String compact() {
+            return (ceiling < 0 ? "none" : String.valueOf(ceiling)) + ":" + ceilingVerdict + ":" + maxListed;
+        }
+
+        public static Sweep parse(String compact) {
+            String[] p = compact.trim().split(":");
+            return new Sweep(List.of(), p[0].equals("none") ? -1 : Integer.parseInt(p[0]),
+                    p.length > 1 ? p[1] : "?", p.length > 2 ? Integer.parseInt(p[2]) : -1);
+        }
+
+        /** The row note that says whether a failing level brackets the operating point. */
+        public String note() {
+            // "generator": the harness's own in-flight cap stopped the level, not the system.
+            return ceiling < 0
+                    ? "sweep ceiling: none up to " + maxListed + " ops/s -- operating point is a lower bound"
+                    : "generator".equals(ceilingVerdict)
+                    ? "sweep ceiling: generator cap hit at " + ceiling + " ops/s, not a system failure"
+                            + " -- operating point is a lower bound"
+                    : "sweep ceiling: first failing level " + ceiling + " ops/s (" + ceilingVerdict + ")";
+        }
+    }
+
+    /**
+     * Offered-load sweep (plan section 12.2: each mix at multiple load levels).
+     * Admits EVERY level the system sustained, because the sweep admits a level from a single run
+     * and that is not enough to report it -- see {@link #measureWithStepDown}.
+     */
+    static Sweep sweepOperatingPoint(int n, Mix mix, int[] levels, int batchSize)
             throws Exception {
         List<Integer> admitted = new ArrayList<>();
         int saturatedAt = -1;
+        String verdict = "-";
         for (int rate : levels) {
-            if (!sweepLevel(n, mix, rate, batchSize)) { saturatedAt = rate; break; }
+            String v = sweepLevel(n, mix, rate, batchSize);
+            if (v != null) { saturatedAt = rate; verdict = v; break; }
             admitted.add(rate);
         }
         if (admitted.isEmpty()) {
@@ -433,9 +479,10 @@ public final class Bench {
         for (int step = 0; step < REFINE_STEPS && hi > 0; step++) {
             int mid = roundLevel((lo + hi) / 2);
             if (mid <= lo || mid >= hi || hi - lo <= Math.max(5, lo / 20)) break;
-            if (sweepLevel(n, mix, mid, batchSize)) { admitted.add(mid); lo = mid; } else { hi = mid; }
+            String v = sweepLevel(n, mix, mid, batchSize);
+            if (v == null) { admitted.add(mid); lo = mid; } else { hi = mid; verdict = v; }
         }
-        return admitted;
+        return new Sweep(admitted, hi, verdict, Arrays.stream(levels).max().orElse(-1));
     }
 
     /** Rounds a refined level to 5 ops/s below 200, 25 below 2000, 50 above. */
@@ -444,8 +491,11 @@ public final class Bench {
         return Math.max(q, (v / q) * q);
     }
 
-    /** One sweep run at one level: true if the schedule is kept within the p99 target. */
-    static boolean sweepLevel(int n, Mix mix, int rate, int batchSize) throws Exception {
+    /**
+     * One sweep run at one level: null if the schedule is kept within the p99 target, otherwise
+     * why not (throughput, p99, inflight or generator).
+     */
+    static String sweepLevel(int n, Mix mix, int rate, int batchSize) throws Exception {
         {
             RunOutcome o = singleRun(n, mix, rate, batchSize, SWEEP_WARMUP_MS, SWEEP_STEADY_MS);
             double p99 = o.hist.percentile(99);
@@ -468,7 +518,9 @@ public final class Bench {
             System.out.printf("    sweep: offered %6d ops/s -> achieved %8.0f ops/s  p99 %8.0f us  %s%s%n",
                     rate, o.throughput, p99, verdict,
                     o.failures > 0 ? "  (" + o.failures + " failed ops)" : "");
-            return sustained;
+            return sustained ? null
+                    : o.overloaded ? (inFlightLimitImpliesSaturation(rate) ? "inflight" : "generator")
+                    : !keepsSchedule ? "throughput" : "p99";
         }
     }
 
@@ -515,6 +567,9 @@ public final class Bench {
 
     /** Sweep only, print "ADMITTED <mix> <levels>", measure nothing (measure-table.sh phase 1). */
     static final boolean SWEEP_ONLY = Boolean.getBoolean("bench.sweepOnly");
+
+    /** {@link Sweep#compact} of the separate sweep invocation (measure-table.sh), or empty. */
+    static final String SWEEP_CEILING = System.getProperty("bench.sweepCeiling", "").trim();
 
     /** Admission path carried in from earlier invocations that stepped down. */
     static final String PRIOR_ADMISSION_PATH = System.getProperty("bench.priorAdmissionPath", "").trim();
@@ -570,6 +625,7 @@ public final class Bench {
         double[][] perRunOp = new double[ops][RUNS];
         for (int t = 0; t < ops; t++) mergedOp[t] = new Histogram();
         long contended = 0;
+        long tier0Reads = 0, tier0Fallbacks = 0;
         int overloadedRuns = 0;
         double[] perRunDrain = new double[RUNS];
         double[] perRunBurstTxns = new double[RUNS];
@@ -591,6 +647,8 @@ public final class Bench {
                 perRunOp[t][run] = o.opThroughput[t];
             }
             if (o.contendedUpdates > 0) contended += o.contendedUpdates;
+            if (o.tier0Reads < 0) tier0Reads = -1;
+            else if (tier0Reads >= 0) { tier0Reads += o.tier0Reads; tier0Fallbacks += o.tier0Fallbacks; }
             if (o.overloaded) overloadedRuns++;
             perRunDrain[run] = o.burstDrainMs;
             perRunBurstTxns[run] = o.burstTxns;
@@ -619,6 +677,15 @@ public final class Bench {
                     + "same DID; raise -Dbench.didPool so update latency excludes that wait%n",
                     name, contended);
             notes += String.format("; WARNING %d contended updates over all runs", contended);
+        }
+        if (tier0Reads < 0) {
+            tier0Fallbacks = -1;
+        } else if (tier0Reads > 0) {
+            // The backend's own notes count only its last run, warm-up included; this is the
+            // figure to report (bench/METRICS.md, "Tier-0 fallback rate").
+            notes += String.format(java.util.Locale.ROOT,
+                    "; Tier-0 fallbacks over all runs: %d of %d reads (%.2f%%), measured window",
+                    tier0Fallbacks, tier0Reads, 100.0 * tier0Fallbacks / tier0Reads);
         }
 
         // An overloaded run stopped early, so its histogram holds only what completed before the
@@ -653,7 +720,8 @@ public final class Bench {
                 Histogram.mean(perRunOp[OpType.REVOKE.ordinal()]),
                 Histogram.mean(perRunDrain), mergedBurst.percentile(99), burstSize,
                 Histogram.mean(perRunBurstTxns), Histogram.mean(perRunBurstConfirmed), perOp,
-                Histogram.ci95(perRunDrain), mergedBurst.percentile(50), mergedBurst.percentile(95));
+                Histogram.ci95(perRunDrain), mergedBurst.percentile(50), mergedBurst.percentile(95),
+                tier0Reads, tier0Fallbacks);
     }
 
     /**
@@ -670,11 +738,16 @@ public final class Bench {
      * @param opThroughput committed ops/s in the steady window per operation, same indexing
      * @param contendedUpdates updates that waited for the same DID's lock (-1 if unknown)
      * @param overloaded the run hit {@link #inFlightLimit} and was stopped early: saturated
+     * @param tier0Reads Tier-0 reads from the first measured arrival to the end of the drain (-1
+     *     if the system has no Tier-0 path). Warm-up reads still in flight at the boundary land
+     *     in the window; at most one inter-arrival interval's worth.
+     * @param tier0Fallbacks of those, how many fell back to Tier 1/2, same window
      */
     public record RunOutcome(Histogram hist, double throughput, Histogram[] opHist, double[] opThroughput,
                       Histogram burst, double burstDrainMs, int burstSize,
                       long burstTxns, long burstTxnsConfirmed, String notes, long failures,
-                      long contendedUpdates, boolean overloaded) {}
+                      long contendedUpdates, boolean overloaded,
+                      long tier0Reads, long tier0Fallbacks) {}
 
     /**
      * One run against whichever system {@link #BACKEND} names.
@@ -728,6 +801,8 @@ public final class Bench {
             final AtomicLong burstLastCommitNanos = new AtomicLong(0);
             final AtomicLong burstStartNanos = new AtomicLong(0);
             long txnsAtBurst = 0, confirmedAtBurst = 0;
+            // Tier-0 counters at the first measured arrival; warm-up reads are not reported.
+            long tier0ReadsAtWindow = -1, tier0FallbacksAtWindow = -1;
             // Updates go round-robin over the whole DID pool. Picking them by idx % DID_POOL (with
             // DID_POOL a multiple of 100) sent every update to the same 16 DIDs, so successive
             // rotations of one DID overlapped and conflicted on both systems.
@@ -769,7 +844,10 @@ public final class Bench {
                 nextArrival += intervalNanos;
                 final long idx = opIndex++;
                 final boolean measured = scheduled >= warmupEndNanos;
-                if (measured) steadyStart.compareAndSet(Long.MAX_VALUE, scheduled);
+                if (measured && steadyStart.compareAndSet(Long.MAX_VALUE, scheduled)) {
+                    tier0ReadsAtWindow = backend.tier0Reads();
+                    tier0FallbacksAtWindow = backend.tier0Fallbacks();
+                }
 
                 if (mix.burst && !burstFired && scheduled >= burstAt) {
                     burstFired = true;
@@ -860,10 +938,17 @@ public final class Bench {
                         + "transaction(s) submitted, %d confirmed%n",
                         BURST_SIZE, burstTxns, burstConfirmed);
             }
+            long tier0Reads = -1, tier0Fallbacks = -1;
+            if (backend.tier0Reads() >= 0) {
+                // No measured arrival (stopped in warm-up): nothing in the window.
+                tier0Reads = tier0ReadsAtWindow < 0 ? 0 : backend.tier0Reads() - tier0ReadsAtWindow;
+                tier0Fallbacks = tier0FallbacksAtWindow < 0 ? 0
+                        : backend.tier0Fallbacks() - tier0FallbacksAtWindow;
+            }
             return new RunOutcome(hist, committed.get() / windowSeconds, opHist, opThroughput,
                     burstHist, drainMs, mix.burst ? BURST_SIZE : 0,
                     burstTxns, burstConfirmed, backend.notes(), failures,
-                    backend.contendedUpdates(), overloaded);
+                    backend.contendedUpdates(), overloaded, tier0Reads, tier0Fallbacks);
             } finally {
                 // backend closed by try-with-resources
             }
@@ -1024,7 +1109,8 @@ public final class Bench {
      * burst_drain_ms, burst_p99_us, burst_size, burst_drain_ci_ms, burst_p50_us, burst_p95_us,
      * burst_txns, burst_txns_confirmed (-1 when the backend cannot count them), then &lt;op&gt;_tput / &lt;op&gt;_p50_us / &lt;op&gt;_p95_us /
      * &lt;op&gt;_p99_us for resolve, register, update, revoke (empty if the op never committed),
-     * then notes, which stays last.
+     * tier0_reads, tier0_fallbacks (-1 when the system has no Tier-0 path), then notes, which
+     * stays last.
      */
     static void writeRowsTsv(List<Result> results, int n) throws Exception {
         StringBuilder sb = new StringBuilder(
@@ -1036,7 +1122,7 @@ public final class Bench {
             sb.append('\t').append(k).append("_tput\t").append(k).append("_p50_us\t")
               .append(k).append("_p95_us\t").append(k).append("_p99_us");
         }
-        sb.append("\tnotes\n");
+        sb.append("\ttier0_reads\ttier0_fallbacks\tnotes\n");
         for (Result r : results) {
             sb.append(String.format(java.util.Locale.ROOT,
                     "%s\t%.1f\t%.1f\t%.0f\t%.0f\t%.0f\t%d\t%d\t%d\t%d\t%.0f\t%.0f\t%d\t%.1f\t%.0f\t%.0f"
@@ -1049,6 +1135,7 @@ public final class Bench {
                 sb.append(o == null ? "\t\t\t\t" : String.format(java.util.Locale.ROOT,
                         "\t%.1f\t%.0f\t%.0f\t%.0f", o.throughput(), o.p50(), o.p95(), o.p99()));
             }
+            sb.append('\t').append(r.tier0Reads).append('\t').append(r.tier0Fallbacks);
             sb.append('\t').append(r.notes.replace('\t', ' ').replace('\n', ' ')).append('\n');
         }
         java.nio.file.Files.writeString(java.nio.file.Path.of("rows.tsv"), sb.toString());

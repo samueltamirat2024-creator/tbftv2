@@ -282,7 +282,7 @@ bench_invoke() {
         -e RESULT_TAG="$tag" -e BENCH_PHASE="$phase" \
         -e JAVA_TOOL_OPTIONS="$BENCH_FLAGS -Dvdr.maxBatchDelayMs=$DELAY_MS $flags" \
         tailored-bench 2>&1 | tee -a "$LOG" "$logf" \
-      | grep -E "^(    sweep|  Tailored|      failures|      stopped|    WARNING|candidate|-- |ADMITTED|STEPDOWN|Tailored BFT VDR --|wrote)"
+      | grep -E "^(    sweep|  Tailored|      failures|      stopped|    WARNING|candidate|-- |ADMITTED|SATURATED_AT|STEPDOWN|Tailored BFT VDR --|wrote)"
     status=${PIPESTATUS[0]}
   else
     say "   registry setup: $regs fresh revocation registries (one per run), then the harness"
@@ -291,7 +291,7 @@ bench_invoke() {
         -e INDY_REGISTRY_COUNT="$regs" \
         -e JAVA_TOOL_OPTIONS="$BENCH_FLAGS -Dindy.maxBatchDelayMs=$DELAY_MS $flags" \
         indy-bench 2>&1 | tee -a "$LOG" "$logf" \
-      | grep -E "^(    sweep|  Hyperledger|      failures|      stopped|    WARNING|candidate|-- |ADMITTED|STEPDOWN|Hyperledger Indy --|wrote|passed)"
+      | grep -E "^(    sweep|  Hyperledger|      failures|      stopped|    WARNING|candidate|-- |ADMITTED|SATURATED_AT|STEPDOWN|Hyperledger Indy --|wrote|passed)"
     status=${PIPESTATUS[0]}
   fi
   set -e
@@ -309,7 +309,7 @@ collect() {              # collect <tailored|indy> <tag> <mix>: file the measure
 }
 
 measure_mix() {          # measure_mix <tailored|indy> <mix>
-  local sys="$1" mix="$2" tag="$STAMP-$1-$2" key status logf admitted prior="" step k level
+  local sys="$1" mix="$2" tag="$STAMP-$1-$2" key status logf admitted ceiling prior="" step k level
   key="$(mix_key "$mix")"
   mkdir -p "$OUT/bench-logs"
   # Registries Indy needs per invocation: one per sweep level / measured run, plus slack.
@@ -343,9 +343,13 @@ measure_mix() {          # measure_mix <tailored|indy> <mix>
   [ "$status" -eq 0 ] || { say "$sys $mix sweep failed (exit $status); see $LOG"; return 1; }
   admitted="$(grep -E "^ADMITTED $mix " "$logf" | tail -1 | awk '{print $3}')"
   [ -n "$admitted" ] || { say "$sys $mix: the sweep admitted no level; see $logf"; return 1; }
+  # The lowest level the sweep failed ("none" if every listed level passed: a lower bound). It goes
+  # into the measured row's notes, so TABLE.md can bracket the knee without the sweep log.
+  ceiling="$(grep -E "^SATURATED_AT $mix " "$logf" | tail -1 | awk '{print $3}')"
+  grep -E "^    sweep:" "$logf" > "$OUT/$sys-$mix-sweep.txt" || true
   local levels_arr
   IFS=, read -ra levels_arr <<<"$admitted"
-  say "   admitted: $admitted; measuring the highest on fresh state, stepping down if its merged p99 misses 500 ms"
+  say "   admitted: $admitted; first failing level: ${ceiling:-unknown}; measuring the highest on fresh state, stepping down if its merged p99 misses 500 ms"
 
   for (( k=${#levels_arr[@]}-1; k>=0; k-- )); do
     level="${levels_arr[$k]}"
@@ -353,7 +357,7 @@ measure_mix() {          # measure_mix <tailored|indy> <mix>
     fresh_state "$sys" || return 1
     logf="$OUT/bench-logs/$sys-$mix-$level.log"
     bench_invoke "$sys" "$tag" measure "$logf" "$regs_measure" \
-        "-Dbench.mixes=$mix -Dbench.admitted.$key=$level $(pool_flag "$mix") ${prior:+-Dbench.priorAdmissionPath=$prior}" \
+        "-Dbench.mixes=$mix -Dbench.admitted.$key=$level $(pool_flag "$mix") ${ceiling:+-Dbench.sweepCeiling=$ceiling} ${prior:+-Dbench.priorAdmissionPath=$prior}" \
         && status=0 || status=$?
     teardown "$sys" "$mix-$level"
     if [ "$status" -eq 0 ]; then

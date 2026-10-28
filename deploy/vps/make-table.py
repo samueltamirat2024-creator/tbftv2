@@ -5,11 +5,12 @@ Build the comparison tables from the rows.tsv files vdr.bench.Bench writes.
     python3 make-table.py --tailored T.tsv --indy I.tsv [--profile standard] [--cpus 4]
     python3 make-table.py ... --equal-load      # rows are "<mix> @ <rate> ops/s"
 
-Four tables:
-  1. every configuration (system x mix), as before;
+Five tables:
+  1. every configuration (system x mix), as before, with each operating point's knee bracket;
   2. Register and Update, Tailored next to Indy, with ratios;
-  3. per-operation latency of the writes inside the mixed workloads;
-  4. the revocation burst (800 revocations at one instant inside bursty-revoke), Tailored next
+  3. per-operation latency of the updates and revocations inside the mixed workloads;
+  4. the Tier-0 fallback rate (F of N reads) of the Tailored BFT VDR in the mixed workloads;
+  5. the revocation burst (800 revocations at one instant inside bursty-revoke), Tailored next
      to Indy, with ratios.
 
 Missing inputs leave their rows as "not measured", so a one-system run still prints the tables.
@@ -61,6 +62,40 @@ def ratio(a, b):
     return f"{a / b:.3g}x" if a is not None and b else "—"
 
 
+def knee(row):
+    """Where the operating point sits: '(R, C]' when a level failed above it, else a lower bound.
+
+    C is the lowest level known to fail: the sweep's first failing level, or a higher admitted
+    level that missed the p99 target when measured (the step-down path). Rows from runs before
+    the sweep ceiling was recorded say nothing.
+    """
+    notes = row["notes"]
+    m = re.search(r"offered (\d+) ops/s", notes)
+    if not m:
+        return None
+    point = int(m.group(1))
+    failing = []
+    c = re.search(r"sweep ceiling: first failing level (\d+) ops/s \((\w+)\)", notes)
+    if c and c.group(2) != "generator":     # the harness's cap, not the system, stopped it
+        failing.append((int(c.group(1)), f"sweep: {c.group(2)}"))
+    p = re.search(r"admission path: ([^;|]+)", notes)
+    if p:
+        for step in p.group(1).split(","):
+            s = re.match(r"\s*(\d+) ops/s -> p99 (\S+) ms", step)
+            if s and int(s.group(1)) > point:
+                failing.append((int(s.group(1)), f"measured p99 {s.group(2)} ms"))
+    if failing:
+        rate, why = min(failing)
+        return f"knee in ({point}, {rate}] ops/s ({why})"
+    n = re.search(r"sweep ceiling: none up to (\d+) ops/s", notes)
+    if n:
+        return f"lower bound: no level failed up to {n.group(1)} ops/s"
+    g = re.search(r"sweep ceiling: generator cap hit at (\d+) ops/s", notes)
+    if g:
+        return f"lower bound: the generator's in-flight cap, not the system, stopped {g.group(1)} ops/s"
+    return None
+
+
 def short_notes(row, mix):
     notes = row["notes"]
     parts = []
@@ -88,6 +123,9 @@ def short_notes(row, mix):
     m = re.search(r"stepped down|admission path: ([^;|]+)", notes)
     if m and m.group(0).startswith("admission path") and "," in m.group(1):
         parts.append("stepped down: " + m.group(1).strip())
+    k = knee(row)
+    if k:
+        parts.append(k)
     return "; ".join(parts)
 
 
@@ -149,12 +187,12 @@ def writes_table(data, mixes, equal):
 
 
 def mixed_write_latency(data, mixes, equal):
-    """Each write's own merged histogram inside the mixed workloads."""
+    """Each write's and revocation's own merged histogram inside the mixed workloads."""
     wanted = [m for m in MIXED if m in mixes]
     rows = []
     for mix in wanted:
         for k in keys_for(data, mix, equal) or [(mix, None)]:
-            for op in WRITES:
+            for op in WRITES + ["revoke"]:
                 cells = []
                 for _, key in SYSTEMS:
                     row = data[key].get(k)
@@ -166,12 +204,50 @@ def mixed_write_latency(data, mixes, equal):
                     rows.append(f"| {label_of(*k)} | {op} | {cells[0]} | {cells[1]} |")
     if not rows:
         return
-    print("\n## Writes inside the mixed workloads (per-operation p50 / p95 / p99)\n")
+    print("\n## Updates and revocations inside the mixed workloads (per-operation p50 / p95 / p99)\n")
     print("| Mix | Operation | Tailored BFT VDR | Hyperledger Indy |")
     print("|---|---|---|---|")
     print("\n".join(rows))
-    print("\nThe mixed workloads' write share is updates only (read-heavy 4%, bursty-revoke 10%), "
-          "so register appears only in its own mix.")
+    print("\nMix compositions: read-heavy = 95% resolve / 4% update / 1% revoke; bursty-revoke = "
+          "90% resolve / 10% update, plus the revocation burst (its own table below; the steady "
+          "stream has no revokes). Neither mixed workload registers, so register appears only in "
+          "its own mix.")
+
+
+def tier0_cells(row):
+    """(fallbacks, reads, rate, window) for one row, or None if the row has no Tier-0 path."""
+    reads, fb = num(row, "tier0_reads"), num(row, "tier0_fallbacks")
+    if reads is not None:
+        if reads < 0:
+            return None
+        rate = f"{100.0 * fb / reads:.2f}%" if reads else "—"
+        return f"{fb:.0f}", f"{reads:.0f}", rate, "measured windows, all runs"
+    # rows.tsv before the tier0_* columns: the backend's own count, last run only, warm-up included.
+    m = re.search(r"Tier-0 fallbacks (\d+)", row["notes"])
+    if not m:
+        return None
+    return m.group(1), "not recorded", "—", "last run only, incl. warm-up"
+
+
+def tier0_table(data, mixes, equal):
+    """How often a Tier-0 read fell back to Tier 1/2 (Tailored only; Indy has no Tier-0 path)."""
+    rows = []
+    for mix in [m for m in MIXED if m in mixes]:
+        for k in keys_for(data, mix, equal) or [(mix, None)]:
+            row = data["tailored"].get(k)
+            cells = tier0_cells(row) if row else None
+            if cells:
+                rows.append(f"| {label_of(*k)} | {' | '.join(cells)} |")
+    if not rows:
+        return
+    print("\n## Tier-0 fallbacks — Tailored BFT VDR\n")
+    print("| Mix | Fallbacks (F) | Tier-0 reads (N) | F / N | Window |")
+    print("|---|---|---|---|---|")
+    print("\n".join(rows))
+    print("\nA fallback is a Tier-0 read re-served at Tier 1 (f+1 replicas) or Tier 2 (ordered) "
+          "because the replica's checkpoint root was not yet f+1-agreed or the replica denied the "
+          "read; it costs latency, never a wrong answer (bench/METRICS.md). Hyperledger Indy has no "
+          "Tier-0 path.")
 
 
 def burst_table(data, mixes, equal):
@@ -281,6 +357,7 @@ def main():
     main_table(data, mixes, a.equal_load)
     writes_table(data, mixes, a.equal_load)
     mixed_write_latency(data, mixes, a.equal_load)
+    tier0_table(data, mixes, a.equal_load)
     burst_table(data, mixes, a.equal_load)
     if a.profile == "quick":
         print("\n> PROFILE=quick: short windows and 3 runs. Use these to check the pipeline, not as "

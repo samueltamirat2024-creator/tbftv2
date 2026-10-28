@@ -91,6 +91,46 @@ backlog rather than the system serving the steady stream. The plan's metric for 
 throughput bounded by batch size rather than consensus round count (§3.4), which is what the drain
 numbers measure.
 
+## Mixed-workload compositions
+
+- **read-heavy**: 95% resolve, 4% update, 1% revoke (steady-state revocations, batched by the
+  gateway like any other revoke).
+- **bursty-revoke**: 90% resolve, 10% update, no steady revokes, plus the revoke burst above.
+
+Neither mixed workload registers. Gate B7 pins the read-heavy composition.
+
+## Tier-0 fallback rate
+
+A Tier-0 read goes to one replica and is verified against an f+1-agreed checkpoint root. It
+**falls back** to Tier 1 (f+1 replicas), and from there possibly to Tier 2 (ordered), when the
+replica denies the read or its root is not (yet) agreed after one on-demand refresh. A fallback
+costs latency, never a wrong answer.
+
+- **N**: Tier-0 reads attempted from the first measured arrival to the end of the drain,
+  **summed over all runs** of the reported level. Warm-up reads still in flight at the boundary
+  can land in the window, at most one inter-arrival interval's worth.
+- **F**: of those, the reads that fell back, over the same window.
+- Reported as F of N (F / N %) in the row notes, as the `tier0_reads` / `tier0_fallbacks`
+  columns of `rows.tsv` (-1 for Indy, which has no Tier-0 path), and in the "Tier-0 fallbacks"
+  table of `TABLE.md`.
+- The backend's own "Tier-0 fallbacks n (last run, incl. warm-up)" in the notes is a
+  per-backend diagnostic. **Do not report it.** `make-table.py` falls back to it only for
+  `rows.tsv` files written before the columns existed, and labels it as such.
+
+## Knee bracket
+
+The sweep records the lowest level it failed (`SATURATED_AT`). The measured row's notes carry it
+as `sweep ceiling: first failing level C ops/s (<reason>)`, with one of these reasons:
+`throughput`, `p99` or `inflight`.
+
+`TABLE.md` reports the operating point R as `knee in (R, C]`. C is the lower of the sweep ceiling
+and any higher admitted level that missed the p99 target when measured (the step-down path).
+
+An operating point is a **lower bound** only in two cases:
+- the sweep passed every listed level (`sweep ceiling: none up to M ops/s`), or
+- the failing level was stopped by the generator's own in-flight cap (`generator`), not by the
+  system.
+
 ## Register and Update mixes
 
 Added after the read-heavy and bursty-revoke definitions were frozen. These are new definitions;

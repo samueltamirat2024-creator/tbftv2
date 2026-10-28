@@ -48,6 +48,7 @@ public final class Gates {
         bSnapshotExcludesPerReplicaState();
         bIncrementalCheckpointEqualsScratch();
         bRegisterAndUpdateMixes();
+        bTier0FallbackAndSweepCeiling();
 
         System.out.println("=".repeat(78));
         System.out.printf("passed %d, failed %d%n", passed, failed);
@@ -689,6 +690,62 @@ public final class Gates {
                             + " samples but " + (issued ? "is" : "is not") + " in the mix");
                 }
             }
+        });
+    }
+
+    /**
+     * Gate B7. The paper reports a Tier-0 fallback rate F / N per mixed workload and a knee bracket
+     * per operating point; both are only as good as their counters. Reads must count every Tier-0
+     * attempt, fallbacks must be a subset, a mix without resolves must report none, and the sweep
+     * ceiling must survive the trip through JAVA_TOOL_OPTIONS. The read-heavy composition is
+     * pinned here because the paper states it (95% resolve, 4% update, 1% revoke).
+     */
+    private static void bTier0FallbackAndSweepCeiling() {
+        gate("B7", "Are Tier-0 fallbacks counted against their reads, and is the sweep ceiling kept?", () -> {
+            int[] share = new int[vdr.bench.Bench.OpType.values().length];
+            for (int r = 0; r < 100; r++) share[vdr.bench.Bench.Mix.READ_HEAVY.opFor(r).ordinal()]++;
+            check(share[0] == 95 && share[1] == 0 && share[2] == 4 && share[3] == 1,
+                    "read-heavy is " + Arrays.toString(share) + " (resolve/register/update/revoke), "
+                    + "not the paper's 95/0/4/1");
+
+            try (SimulatedCluster c = SimulatedCluster.standard(4)) {
+                VdrClient alice = client(c, "alice");
+                alice.register("did:vdr:t0count", doc("t0"));
+                for (ServiceReplica r : c.replicas()) r.store().forceCheckpoint();
+                for (int i = 0; i < 20; i++) alice.resolveTier0("did:vdr:t0count", i);
+                check(alice.tier0Reads.sum() == 20, "20 Tier-0 reads counted as " + alice.tier0Reads.sum());
+                // Registered after the checkpoint: no replica can prove it at Tier 0 yet.
+                alice.register("did:vdr:t0late", doc("late"));
+                alice.resolveTier0("did:vdr:t0late", 0);
+                check(alice.tier0Reads.sum() == 21, "the fallback read was not counted as a read");
+                check(alice.tier0Fallbacks.sum() >= 1 && alice.tier0Fallbacks.sum() <= alice.tier0Reads.sum(),
+                        "fallbacks " + alice.tier0Fallbacks.sum() + " of " + alice.tier0Reads.sum() + " reads");
+            }
+
+            vdr.bench.Bench.RunOutcome rh, up;
+            try {
+                rh = vdr.bench.Bench.singleRun(4, vdr.bench.Bench.Mix.READ_HEAVY, 100, 250, 300, 1500);
+                up = vdr.bench.Bench.singleRun(4, vdr.bench.Bench.Mix.UPDATE, 100, 250, 300, 1500);
+            } catch (Exception e) {
+                throw new AssertionError("run failed: " + e, e);
+            }
+            long resolves = rh.opHist()[vdr.bench.Bench.OpType.RESOLVE.ordinal()].count();
+            check(rh.tier0Reads() >= resolves, "read-heavy: " + rh.tier0Reads()
+                    + " Tier-0 reads in the window but " + resolves + " resolves committed in it");
+            check(rh.tier0Fallbacks() >= 0 && rh.tier0Fallbacks() <= rh.tier0Reads(),
+                    "read-heavy: fallbacks " + rh.tier0Fallbacks() + " of " + rh.tier0Reads());
+            check(up.tier0Reads() == 0 && up.tier0Fallbacks() == 0,
+                    "update mix reported Tier-0 traffic: " + up.tier0Reads() + " / " + up.tier0Fallbacks());
+
+            vdr.bench.Bench.Sweep failed = vdr.bench.Bench.Sweep.parse(
+                    new vdr.bench.Bench.Sweep(List.of(150, 175), 200, "throughput", 600).compact());
+            check(failed.ceiling() == 200 && failed.ceilingVerdict().equals("throughput")
+                    && failed.maxListed() == 600, "sweep ceiling did not round-trip: " + failed);
+            check(!failed.note().contains("lower bound"), "a bracketed point was called a lower bound");
+            vdr.bench.Bench.Sweep none = vdr.bench.Bench.Sweep.parse(
+                    new vdr.bench.Bench.Sweep(List.of(600), -1, "-", 600).compact());
+            check(none.ceiling() == -1 && none.note().contains("lower bound"),
+                    "a sweep with no failing level must report a lower bound: " + none.note());
         });
     }
 
