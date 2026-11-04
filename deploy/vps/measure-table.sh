@@ -43,7 +43,7 @@ PROFILE="${PROFILE:-standard}"
 SYSTEMS="${SYSTEMS:-tailored indy}"
 DELAY_MS="${VDR_MAX_BATCH_DELAY_MS:-50}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-OUT="results/table/$STAMP"
+OUT="results/table/$STAMP${OUT_LABEL:+-$OUT_LABEL}"
 mkdir -p "$OUT" results/tailored-bft results/indy
 LOG="$OUT/measure.log"
 say() { echo "$*" | tee -a "$LOG"; }
@@ -57,6 +57,9 @@ case "$PROFILE" in
   full)     SWEEP_W=60000; SWEEP_S=60000; WARM=60000; STEADY=60000; RUNS=10; REFINE=3 ;;
   *) echo "PROFILE must be quick, standard or full" >&2; exit 2 ;;
 esac
+# Overrides for deploy/vps/diagnose.sh, which varies one thing at a time.
+RUNS="${RUNS_OVERRIDE:-$RUNS}"
+STEADY="${STEADY_OVERRIDE:-$STEADY}"
 # REPEAT_FRESH=1: each of the RUNS repetitions gets its own fresh cluster or wiped ledger and its own
 # generator JVM, so runs are independent samples and stats.py can bootstrap over them. REPEAT_FRESH=0
 # runs them all on one cluster and JVM, with each run adding 400 DIDs: faster, but those runs are
@@ -107,7 +110,7 @@ mix_flags() {
 }
 
 BENCH_FLAGS="-Xms1g -Xmx2g -Dbench.warmupMs=$WARM -Dbench.steadyMs=$STEADY -Dbench.runs=$RUNS \
- -Dbench.sweepWarmupMs=$SWEEP_W -Dbench.sweepSteadyMs=$SWEEP_S -Dbench.refine=$REFINE"
+ -Dbench.sweepWarmupMs=$SWEEP_W -Dbench.sweepSteadyMs=$SWEEP_S -Dbench.refine=$REFINE ${BENCH_EXTRA_FLAGS:-}"
 MIXES="${MIXES:-read-heavy bursty-revoke register update}"
 for MIX in $MIXES; do
   case "$MIX" in read-heavy|bursty-revoke|register|update) ;;
@@ -155,7 +158,7 @@ docker run --rm vdr-bench sh -c 'ls vdr-bftsmart/lib | grep -q bcprov && echo "E
 
 # BFT-SMaRt replica keys (system.communication.defaultkeys=false): generated on this machine,
 # never shipped in the image.
-CFG="$(cd ../../config && pwd)"
+CFG="$(cd "${VDR_CONFIG_DIR:-../../config}" && pwd)"
 if grep -Eq '^system\.communication\.defaultkeys *= *false' "$CFG/system.config"; then
   for i in 0 1 2 3; do
     if [ ! -f "$CFG/keys/privatekey$i" ] || [ ! -f "$CFG/keys/publickey$i" ]; then
@@ -204,7 +207,9 @@ cluster_up() {
 
 save_replica_logs() {    # save_replica_logs <label>
   mkdir -p "$OUT/replica-logs/$1"
-  for r in "${REPLICAS[@]}"; do replica_log "$r" > "$OUT/replica-logs/$1/$r.log"; done
+  for r in "${REPLICAS[@]}"; do
+    "${COMPOSE[@]}" logs --no-color --timestamps "$r" > "$OUT/replica-logs/$1/$r.log" 2>/dev/null || true
+  done
 }
 
 latest_result() {        # latest_result <results subdir> <tag> -> path of that run's folder
@@ -343,6 +348,12 @@ repeat_level() {
     say "-- $mix @ $level ops/s: repetition $k of $RUNS, fresh state"
     fresh_state "$sys" || return 1
     start_sampler "$rep/resources.tsv"
+    if [ -n "${PRELOAD_SEPARATE_MS:-}" ]; then
+      # Warm the replicas from a JVM that then exits, so the measuring generator starts cold.
+      bench_invoke "$sys" "$tag-preload" sweep "$rep/preload.log" 6 \
+          "-Dbench.runs=1 -Dbench.stepdown=false -Dbench.rawOutput=false -Dbench.warmupMs=0 -Dbench.steadyMs=$PRELOAD_SEPARATE_MS $flags" \
+          || { say "$sys $mix @ $level preload failed; see $rep/preload.log"; stop_sampler; return 1; }
+    fi
     # The later -Dbench.runs overrides the one in BENCH_FLAGS. Registries: one run, plus slack.
     bench_invoke "$sys" "$tag" measure "$rep/bench.log" 6 \
         "-Dbench.runs=1 -Dbench.stepdown=false $flags" && status=0 || status=$?

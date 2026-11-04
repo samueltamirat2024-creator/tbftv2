@@ -89,6 +89,14 @@ class Bootstrap(unittest.TestCase):
             hits += low <= truth <= high
         self.assertGreater(hits / trials, 0.78 if QUICK else 0.84)
 
+    def test_very_small_samples_do_not_crash(self):
+        # A pilot with two repetitions reaches this after its measurements have finished.
+        for values in ([1.0, 2.0], [1.0, 1.0, 9.0], [5.0, 900.0]):
+            low, high = stats.bca(stats.mean_stat(values), [len(values)], resamples=500)
+            self.assertLessEqual(low, high)
+        low, high = stats.bca(stats.ratio_stat([1.0, 2.0], [3.0, 4.0]), [2, 2], resamples=500)
+        self.assertLessEqual(low, high)
+
     def test_identical_runs_give_a_point(self):
         self.assertEqual(stats.bca(stats.mean_stat([5.0] * 10), [10], resamples=200), (5.0, 5.0))
 

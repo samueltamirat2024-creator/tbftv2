@@ -65,7 +65,7 @@ x-vdr-replica: &vdr-replica
   # ordering thread measures contention rather than consensus.
   cpus: ${REPLICA_CPUS:-1}
   volumes:
-    - ../../config:/work/config:ro
+    - ${VDR_CONFIG_DIR:-../../config}:/work/config:ro
   restart: unless-stopped
   environment:
     # The image compiled the module already; skip recompiling at every replica start.
@@ -182,7 +182,7 @@ services:
       VDR_BFTSMART_CONFIG: /work/config
     volumes:
       - ./results/tailored-bft:/work/artifact/results
-      - ../../config:/work/config:ro
+      - ${VDR_CONFIG_DIR:-../../config}:/work/config:ro
     depends_on: [vdr-replica-0, vdr-replica-1, vdr-replica-2, vdr-replica-3]
 
   # Measurement-only Tailored runner used by measure-table.sh: environment capture + vdr.bench.Bench
@@ -198,7 +198,7 @@ services:
       RESULT_TAG: ${RESULT_TAG:-}
     volumes:
       - ./results/tailored-bft:/results
-      - ../../config:/work/config:ro
+      - ${VDR_CONFIG_DIR:-../../config}:/work/config:ro
 
   # Indy baseline: probe, one-time registry setup, then the same vdr.bench.Bench harness.
   # The nofile limit comes from the shared x-bench anchor above.

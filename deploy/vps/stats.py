@@ -138,11 +138,15 @@ def bca(stat, sizes, resamples=RESAMPLES, seed=SEED, alpha=0.05):
     effective = min(sizes)
     if effective >= 2 and alpha == 0.05:
         t = T95[effective - 2] if effective - 2 < len(T95) else 1.96
-        alpha = 2 * ND.cdf(-math.sqrt(effective / (effective - 1)) * t)
+        # At very small n this leaves almost no tail; the interval is then the resamples' full range.
+        alpha = max(2 * ND.cdf(-math.sqrt(effective / (effective - 1)) * t), 2 / resamples)
 
     def endpoint(q):
         z = ND.inv_cdf(q)
-        adjusted = ND.cdf(z0 + (z0 + z) / (1 - accel * (z0 + z)))
+        denominator = 1 - accel * (z0 + z)
+        if denominator <= 0:        # BCa's correction has broken down: take that tail's extreme
+            return boots[0] if z < 0 else boots[-1]
+        adjusted = ND.cdf(z0 + (z0 + z) / denominator)
         index = min(max(int(adjusted * resamples), 0), resamples - 1)
         return boots[index]
 

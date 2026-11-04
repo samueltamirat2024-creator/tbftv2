@@ -153,6 +153,22 @@ the target moves to `reps-rejected/`.
 
 `python3 test_stats.py` checks the statistics against known answers; run it before trusting them.
 
+## Diagnosing the write tail and start-up stall
+
+```bash
+DIAG_PROFILE=quick DIAG_RUNS=2 DIAG_RATE_REGISTER=500 DIAG_RATE_UPDATE=500 ./diagnose.sh   # pilot first
+DIAG_RATE_REGISTER=500 DIAG_RATE_UPDATE=500 ./diagnose.sh                                  # the real one
+python3 diagnose.py results/diagnose/<stamp>
+```
+
+Pick rates each mix sustains, from a current table. Each configuration changes one thing against
+`baseline`; `diagnose.sh` lists them. `DIAGNOSIS.md` gives a verdict per cause by the rule at the top of
+`diagnose.py`, which needs both coincidence beyond chance and an intervention that helps. `overlay.tsv`
+holds each baseline run second by second with its events, for plotting. Pilot data is headed
+**NOT CONCLUSIVE**. These runs carry GC logging and timing, so their tables are not for reporting.
+
+`python3 test_diagnose.py` checks that the analysis finds a planted cause and rejects decoys.
+
 ## 5. The one compromise on a 4 vCPU server
 
 Four nodes take all four vCPUs, so the load generator shares cores 0–3 with them. It is the same

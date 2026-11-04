@@ -27,7 +27,7 @@ public final class TimeSeries {
 
     private static final class Second {
         final Slot[] slots = new Slot[SLOTS];
-        long maxInFlight;
+        long maxInFlight, maxScheduleLag, maxDispatchLag;
 
         Slot slot(int i) {
             if (slots[i] == null) slots[i] = new Slot();
@@ -75,6 +75,21 @@ public final class TimeSeries {
         synchronized (sec) { if (value > sec.maxInFlight) sec.maxInFlight = value; }
     }
 
+    /**
+     * How late the arrival loop issued an operation. Lag here is the generator's own stall, whatever
+     * the system under test is doing.
+     */
+    public void scheduleLag(long micros, long nowNanos) {
+        Second sec = at(nowNanos);
+        synchronized (sec) { if (micros > sec.maxScheduleLag) sec.maxScheduleLag = micros; }
+    }
+
+    /** How long an issued operation waited for a generator thread before reaching the backend. */
+    public void dispatchLag(long micros, long nowNanos) {
+        Second sec = at(nowNanos);
+        synchronized (sec) { if (micros > sec.maxDispatchLag) sec.maxDispatchLag = micros; }
+    }
+
     /** One JSON object per second that saw anything, for deploy/vps/stats.py. */
     public void appendJson(StringBuilder out, String prefixFields) {
         for (int i = 0; i < seconds.length; i++) {
@@ -87,6 +102,8 @@ public final class TimeSeries {
                    .append(",\"sec\":").append(i)
                    .append(",\"epoch_ms\":").append(startEpochMs + i * 1000L)
                    .append(",\"in_flight\":").append(sec.maxInFlight)
+                   .append(",\"schedule_lag_us\":").append(sec.maxScheduleLag)
+                   .append(",\"dispatch_lag_us\":").append(sec.maxDispatchLag)
                    .append(",\"ops\":{");
                 boolean first = true;
                 for (int k = 0; k < SLOTS; k++) {

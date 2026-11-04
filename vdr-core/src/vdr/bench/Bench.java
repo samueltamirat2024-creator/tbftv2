@@ -51,6 +51,11 @@ public final class Bench {
      * REPEAT_FRESH, where each invocation is one repetition: the step-down is decided on the
      * histogram merged across all repetitions, which no single invocation can see.
      */
+    /**
+     * A throwaway load in this JVM before a level's first run, discarded entirely. With fresh replicas
+     * this warms replicas and generator together (deploy/vps/diagnose.sh, warm-both).
+     */
+    static final long PRELOAD_MS = Long.getLong("bench.preloadMs", 0L);
     static final boolean STEPDOWN = !"false".equalsIgnoreCase(System.getProperty("bench.stepdown", "true"));
     /**
      * DIDs written before warm-up, which resolves and updates then cycle over. Overridable because
@@ -169,6 +174,7 @@ public final class Bench {
 
     static void run(String[] args) throws Exception {
         int n = args.length > 0 ? Integer.parseInt(args[0]) : 4;
+        JvmSampler.start("generator");
         System.out.println(BACKEND.displayName() + " -- evaluation harness");
         System.out.printf("n = %d (f = %d), runs = %d, warm-up = %d ms, steady state = %d ms%n",
                 n, (n - 1) / 3, RUNS, WARMUP_MS, STEADY_MS);
@@ -645,6 +651,10 @@ public final class Bench {
         long failures = 0;
         int invalidRuns = 0;
 
+        if (PRELOAD_MS > 0) {
+            System.out.printf("  %s: preload of %d ms, discarded%n", name, PRELOAD_MS);
+            singleRun(n, mix, offeredRate, batchSize, 0, PRELOAD_MS);
+        }
         for (int run = 0; run < RUNS; run++) {
             RunOutcome o = singleRun(n, mix, offeredRate, batchSize, WARMUP_MS, STEADY_MS);
             RunLog.append(name, mix, offeredRate, n, run, WARMUP_MS, STEADY_MS, o);
@@ -867,6 +877,7 @@ public final class Bench {
                 if (nextArrival > now) break;
                 final long scheduled = nextArrival;     // coordinated-omission-free timestamp
                 nextArrival += intervalNanos;
+                series.scheduleLag((now - scheduled) / 1000, now);
                 final long idx = opIndex++;
                 final boolean measured = scheduled >= warmupEndNanos;
                 if (measured && steadyStart.compareAndSet(Long.MAX_VALUE, scheduled)) {
@@ -892,6 +903,8 @@ public final class Bench {
                 };
                 inFlight.incrementAndGet();
                 pool.execute(() -> {
+                    long startedNanos = System.nanoTime();
+                    series.dispatchLag((startedNanos - scheduled) / 1000, startedNanos);
                     try {
                         switch (op) {
                             case RESOLVE -> backend.resolve(did, (int) idx);
