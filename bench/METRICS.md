@@ -22,7 +22,9 @@ End-to-end: client request submission to acceptance of the reply, **including cl
 verification**. The timestamp is the *scheduled* arrival instant, not the instant a worker thread
 picked the request up — that is what makes the measurement coordinated-omission-free.
 
-- Recorded at 1 µs precision.
+- Recorded in µs, in log-linear buckets: exact below 128 µs, then up to about 1.6% wide. A percentile
+  reads the bucket's lower edge, so it can read up to about 1.6% low. (Corrected 2026-11-04; this
+  line previously claimed 1 µs precision throughout.)
 - p50/p95/p99 are read from the histogram **merged across all runs** of a configuration. They are
   never averaged from per-run percentiles.
 
@@ -160,6 +162,25 @@ register/update number is collected.
 
 `RUNS` ≥ 10 per configuration (plan §12.3). Throughput reported as mean ± 95% CI across runs.
 Significance testing of H1's claims against both baselines is done at M9, not here.
+
+### Amendment, 2026-11-04 (pending the sign-off below)
+
+Proposed because the protocol above did not make runs independent or keep the data needed for an
+interval on a percentile. Definitions of latency and throughput are unchanged.
+
+- **The sample is an independent repetition.** Each of the 10 runs has its own fresh cluster or wiped
+  ledger and its own generator JVM (`REPEAT_FRESH=1`, the default under `PROFILE=full`). Runs that
+  share a cluster and JVM are flagged as not reportable.
+- **Intervals** are 95% expanded BCa bootstrap over runs, 10,000 resamples, seeded
+  (`deploy/vps/stats.py`). A percentile's interval merges each resample's histograms. Throughput also
+  shows a t interval; the harness's half-width now uses t rather than z = 1.96.
+- **Tests** are two-sided permutation tests of the difference in per-run means, with Holm correction
+  across the report, and Cliff's delta beside each. Percentile tests use per-run percentiles.
+- **Measured coverage** of nominal 95% intervals at n = 10, on simulated data
+  (`deploy/vps/test_stats.py`): means 93-94%, ratios of means 96%, merged p99 86-97%. The p99 figure
+  is lowest when runs differ most from each other, and more runs is the only real remedy.
+- **Invalid runs.** A run whose burst had failures, did not finish, or did not fire is excluded and
+  named in the table. Excluding one drops the row below 10 runs, and so makes it not reportable.
 
 ## Sign-off
 

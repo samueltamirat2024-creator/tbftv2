@@ -47,6 +47,12 @@ public final class Bench {
     static final long WARMUP_MS = Long.getLong("bench.warmupMs", 60_000L);
     static final long STEADY_MS = Long.getLong("bench.steadyMs", 60_000L);
     /**
+     * False: measure the top admitted level and report it, whatever its p99. For measure-table.sh's
+     * REPEAT_FRESH, where each invocation is one repetition: the step-down is decided on the
+     * histogram merged across all repetitions, which no single invocation can see.
+     */
+    static final boolean STEPDOWN = !"false".equalsIgnoreCase(System.getProperty("bench.stepdown", "true"));
+    /**
      * DIDs written before warm-up, which resolves and updates then cycle over. Overridable because
      * updates are serialised per DID on both systems: once the update rate x update latency exceeds
      * the pool, updates queue behind each other's locks (reported as contendedUpdates in the notes).
@@ -235,7 +241,9 @@ public final class Bench {
                         mix.label(), admitted);
             }
             try {
-                Result r = measureWithStepDown(label + " -- " + mix.label(), n, mix, admitted);
+                Result r = STEPDOWN
+                        ? measureWithStepDown(label + " -- " + mix.label(), n, mix, admitted)
+                        : measure(label + " -- " + mix.label(), n, mix, admitted.get(admitted.size() - 1));
                 results.add(ceiling == null ? r : r.withNotes(r.notes() + "; " + ceiling.note()));
             } catch (NoLevelMetTarget e) {
                 // Exit 3 tells measure-table.sh to step down on a FRESH cluster, carrying the path.
@@ -635,11 +643,14 @@ public final class Bench {
         int batchSize = 250;
         String backendNotes = "";
         long failures = 0;
+        int invalidRuns = 0;
 
         for (int run = 0; run < RUNS; run++) {
             RunOutcome o = singleRun(n, mix, offeredRate, batchSize, WARMUP_MS, STEADY_MS);
+            RunLog.append(name, mix, offeredRate, n, run, WARMUP_MS, STEADY_MS, o);
             backendNotes = o.notes;
             failures += o.failures;
+            if (!o.invalidReason.isEmpty()) invalidRuns++;
             merged.merge(o.hist);
             perRunThroughput[run] = o.throughput;
             for (int t = 0; t < ops; t++) {
@@ -671,6 +682,11 @@ public final class Bench {
         // off, fast path Tier 0" on Hyperledger Indy rows, which have neither.
         String notes = String.format("offered %d ops/s, %d runs, %d failed ops; %s",
                 offeredRate, RUNS, failures, backendNotes);
+        if (invalidRuns > 0) {
+            System.out.printf("    WARNING: %s: %d of %d runs are invalid; see runs.jsonl%n",
+                    name, invalidRuns, RUNS);
+            notes += String.format("; INVALID %d of %d runs (burst incomplete)", invalidRuns, RUNS);
+        }
         if (contended > 0) {
             // Each backend's notes() shows only its last run's count; this is the total.
             System.out.printf("    WARNING: %s: %d updates waited for an in-flight update of the "
@@ -742,12 +758,17 @@ public final class Bench {
      *     if the system has no Tier-0 path). Warm-up reads still in flight at the boundary land
      *     in the window; at most one inter-arrival interval's worth.
      * @param tier0Fallbacks of those, how many fell back to Tier 1/2, same window
+     * @param series the run second by second, warm-up included
+     * @param burstFailed burst revocations the system refused or failed. They never reach the burst
+     *     histogram, so without this count a partly failed burst just reads as a faster drain.
+     * @param invalidReason why this run must not be reported; empty if it may be
      */
     public record RunOutcome(Histogram hist, double throughput, Histogram[] opHist, double[] opThroughput,
                       Histogram burst, double burstDrainMs, int burstSize,
                       long burstTxns, long burstTxnsConfirmed, String notes, long failures,
                       long contendedUpdates, boolean overloaded,
-                      long tier0Reads, long tier0Fallbacks) {}
+                      long tier0Reads, long tier0Fallbacks, TimeSeries series,
+                      long burstFailed, String invalidReason) {}
 
     /**
      * One run against whichever system {@link #BACKEND} names.
@@ -786,6 +807,9 @@ public final class Bench {
             long start = System.nanoTime();
             long warmupEndNanos = start + warmupMs * 1_000_000L;
             long endNanos = warmupEndNanos + steadyMs * 1_000_000L;
+            // Room for the window and the longest drains below; a later sample lands in the last slot.
+            final TimeSeries series = new TimeSeries(start, (warmupMs + steadyMs) / 1000 + 260);
+            final AtomicLong burstFailed = new AtomicLong();
 
             // ---- open-loop arrival schedule: fixed inter-arrival interval, no back-pressure
             long intervalNanos = 1_000_000_000L / offeredRate;
@@ -830,6 +854,7 @@ public final class Bench {
                     break arrivals;
                 }
                 long now = System.nanoTime();
+                series.inFlight(inFlight.get(), now);
                 if (now < nextArrival) {
                     LockSupport.parkNanos(nextArrival - now);
                     continue;
@@ -855,7 +880,7 @@ public final class Bench {
                     confirmedAtBurst = backend.revocationTransactionsConfirmed();
                     burstStartNanos.set(System.nanoTime());
                     fireRevocationBurst(backend, dids, burstHist, burstCommitted, burstRevokes,
-                            BURST_SIZE, scheduled, burstLastCommitNanos);
+                            BURST_SIZE, scheduled, burstLastCommitNanos, burstFailed, series);
                     continue;
                 }
 
@@ -875,10 +900,12 @@ public final class Bench {
                             case REVOKE -> backend.submitRevoke(backend.registryIdFor(did),
                                     handle(idx)).join();
                         }
+                        long doneNanos = System.nanoTime();
+                        series.record(op.ordinal(), (doneNanos - scheduled) / 1000, measured, doneNanos);
                         if (measured) {
                             // One timestamp for both histograms, so the per-op split is exactly
                             // a partition of the mix histogram.
-                            long micros = (System.nanoTime() - scheduled) / 1000;
+                            long micros = (doneNanos - scheduled) / 1000;
                             synchronized (hist) { hist.record(micros); }
                             Histogram h = opHist[op.ordinal()];
                             synchronized (h) { h.record(micros); }
@@ -887,6 +914,7 @@ public final class Bench {
                         }
                     } catch (Exception e) {
                         opFailed[op.ordinal()].incrementAndGet();
+                        series.failure(op.ordinal(), System.nanoTime());
                         firstFailure.compareAndSet(null, String.valueOf(e));
                         // a failed operation is not a committed operation; it is excluded from
                         // throughput and from the latency histogram, never counted as a success
@@ -913,6 +941,24 @@ public final class Bench {
                         + "-- later runs in this JVM may be affected");
                 pool.shutdownNow();
             }
+
+            // Burst completions arrive on callbacks the pool does not track. A drain read before the
+            // last of them would come out short.
+            long burstDeadline = System.nanoTime() + 120_000_000_000L;
+            while (burstFired && burstRevokes.get() + burstFailed.get() < BURST_SIZE
+                    && System.nanoTime() < burstDeadline) {
+                LockSupport.parkNanos(10_000_000L);
+            }
+            String invalidReason = "";
+            if (mix.burst && !burstFired) {
+                invalidReason = "the run stopped before the burst fired";
+            } else if (burstFired && burstFailed.get() > 0) {
+                invalidReason = burstFailed.get() + " of " + BURST_SIZE + " burst revocations failed";
+            } else if (burstFired && burstRevokes.get() < BURST_SIZE) {
+                invalidReason = "only " + burstRevokes.get() + " of " + BURST_SIZE
+                        + " burst revocations committed before the deadline";
+            }
+            if (!invalidReason.isEmpty()) System.out.println("      INVALID RUN: " + invalidReason);
 
             // The fixed arrival window. Dividing by wall time up to the last completion charges
             // the post-window drain — Indy's serial revocation chain, in-flight writes — against
@@ -948,7 +994,8 @@ public final class Bench {
             return new RunOutcome(hist, committed.get() / windowSeconds, opHist, opThroughput,
                     burstHist, drainMs, mix.burst ? BURST_SIZE : 0,
                     burstTxns, burstConfirmed, backend.notes(), failures,
-                    backend.contendedUpdates(), overloaded, tier0Reads, tier0Fallbacks);
+                    backend.contendedUpdates(), overloaded, tier0Reads, tier0Fallbacks, series,
+                    burstFailed.get(), invalidReason);
             } finally {
                 // backend closed by try-with-resources
             }
@@ -968,14 +1015,18 @@ public final class Bench {
     static void fireRevocationBurst(Backend backend,
                                     List<String> dids, Histogram burstHist, AtomicLong committed,
                                     AtomicLong revokes, int burstSize, long scheduled,
-                                    AtomicLong lastCommitNanos) {
+                                    AtomicLong lastCommitNanos, AtomicLong failed, TimeSeries series) {
         String registryId = backend.registryIdFor(dids.get(0));
         for (int i = 0; i < burstSize; i++) {
             backend.submitRevoke(registryId, handle(i))
                     .whenComplete((ok, err) -> {
+                        long doneNanos = System.nanoTime();
                         if (err != null) {
+                            failed.incrementAndGet();
+                            series.failure(TimeSeries.BURST_SLOT, doneNanos);
                             return;
                         }
+                        series.record(TimeSeries.BURST_SLOT, (doneNanos - scheduled) / 1000, false, doneNanos);
                         // Every burst arrival shares the injection instant: that is the
                         // incident-response model, and it is why these latencies are reported as
                         // burst drain rather than folded into the steady-mix percentiles.

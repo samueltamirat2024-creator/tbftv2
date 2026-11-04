@@ -65,6 +65,21 @@ public final class Histogram {
         return max;
     }
 
+    /** Non-empty buckets as [lower edge us, count]; the form deploy/vps/stats.py merges and reads. */
+    void appendJson(StringBuilder out) {
+        out.append("{\"n\":").append(total).append(",\"sum\":").append(sum)
+           .append(",\"max\":").append(max).append(",\"early\":").append(earlyIssued)
+           .append(",\"buckets\":[");
+        boolean first = true;
+        for (int i = 0; i < counts.length; i++) {
+            if (counts[i] == 0) continue;
+            if (!first) out.append(',');
+            first = false;
+            out.append('[').append(value(i)).append(',').append(counts[i]).append(']');
+        }
+        out.append("]}");
+    }
+
     private static int index(long v) {
         if (v < SUB_BUCKETS) return (int) v;
         int msb = 63 - Long.numberOfLeadingZeros(v);
@@ -80,6 +95,12 @@ public final class Histogram {
         return octave == 0 ? sub : ((long) sub) << octave;
     }
 
+    /** Two-sided 95% Student's t quantiles for df = 1..30; beyond that the normal value is close. */
+    private static final double[] T95 = {
+        12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228,
+        2.201, 2.179, 2.160, 2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086,
+        2.080, 2.074, 2.069, 2.064, 2.060, 2.056, 2.052, 2.048, 2.045, 2.042};
+
     /** 95% confidence interval half-width for a set of per-run throughput values. */
     public static double ci95(double[] samples) {
         if (samples.length < 2) return 0;
@@ -89,7 +110,8 @@ public final class Histogram {
         double var = 0;
         for (double s : samples) var += (s - mean) * (s - mean);
         var /= (samples.length - 1);
-        return 1.96 * Math.sqrt(var / samples.length);
+        double t = samples.length - 2 < T95.length ? T95[samples.length - 2] : 1.96;
+        return t * Math.sqrt(var / samples.length);
     }
 
     public static double mean(double[] samples) {

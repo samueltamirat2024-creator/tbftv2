@@ -19,12 +19,14 @@ Latency is reported in milliseconds; the harness records microseconds.
 import argparse
 import csv
 import re
+import sys
 from pathlib import Path
 
 SYSTEMS = [("Tailored BFT VDR", "tailored"), ("Hyperledger Indy baseline", "indy")]
 MIXES = ["read-heavy", "bursty-revoke", "register", "update"]
 MIXED = ["read-heavy", "bursty-revoke"]
 WRITES = ["register", "update"]
+PROTOCOL_RUNS = 10              # bench/METRICS.md, as in compare.py
 
 
 def load(path):
@@ -60,6 +62,35 @@ def burst_size(row):
 
 def ratio(a, b):
     return f"{a / b:.3g}x" if a is not None and b else "—"
+
+
+def tput_cell(row):
+    """Mean with its interval: the bootstrap from stats.py when present, else mean +- half-width."""
+    t = float(row["throughput"])
+    lo, hi = num(row, "tput_ci_lo"), num(row, "tput_ci_hi")
+    if lo is not None and hi is not None:
+        return f"{t:.0f} [{lo:.0f}, {hi:.0f}]"
+    return f"{t:.0f} ± {float(row['ci95']):.0f}"
+
+
+def p99_cell(row):
+    lo, hi = num(row, "p99_ci_lo"), num(row, "p99_ci_hi")
+    if lo is not None and hi is not None:
+        return f"{ms(row['p99_us'])} [{ms(lo)}, {ms(hi)}]"
+    return ms(row["p99_us"])
+
+
+def reportability(data):
+    """Why these rows cannot be reported, one reason per row."""
+    problems = []
+    for key, rows in data.items():
+        for (mix, rate), row in rows.items():
+            label = f"{key} {label_of(mix, rate)}"
+            if int(row["runs"]) < PROTOCOL_RUNS:
+                problems.append(f"{label}: {row['runs']} runs, below the protocol's {PROTOCOL_RUNS}")
+            if row.get("independent_runs") != "1":
+                problems.append(f"{label}: runs shared a cluster and JVM, so they are not independent")
+    return problems
 
 
 def knee(row):
@@ -152,9 +183,8 @@ def main_table(data, mixes, equal):
                 if not row:
                     print(f"| {label} | — | — | not measured in this run |")
                     continue
-                tput = f"{float(row['throughput']):.0f} ± {float(row['ci95']):.0f}"
-                lat = f"{ms(row['p50_us'])} / {ms(row['p95_us'])} / {ms(row['p99_us'])} ms"
-                print(f"| {label} | {tput} | {lat} | {short_notes(row, mix)} |")
+                lat = f"{ms(row['p50_us'])} / {ms(row['p95_us'])} / {p99_cell(row)} ms"
+                print(f"| {label} | {tput_cell(row)} | {lat} | {short_notes(row, mix)} |")
 
 
 def writes_table(data, mixes, equal):
@@ -178,11 +208,11 @@ def writes_table(data, mixes, equal):
                 print(f"| {label} | (not measured on {'Tailored' if not t else 'Indy'}) | | | |")
                 continue
             tt, it = float(t["throughput"]), float(i["throughput"])
-            print(f"| {label} | throughput (ops/s) | {tt:.0f} ± {float(t['ci95']):.0f} "
-                  f"| {it:.0f} ± {float(i['ci95']):.0f} | {ratio(tt, it)} |")
+            print(f"| {label} | throughput (ops/s) | {tput_cell(t)} | {tput_cell(i)} | {ratio(tt, it)} |")
             for p in ("p50", "p95", "p99"):
                 a, b = float(t[f"{p}_us"]), float(i[f"{p}_us"])
-                print(f"| {label} | {p} latency (ms) | {ms(a)} | {ms(b)} | {ratio(a, b)} |")
+                ca, cb = (p99_cell(t), p99_cell(i)) if p == "p99" else (ms(a), ms(b))
+                print(f"| {label} | {p} latency (ms) | {ca} | {cb} | {ratio(a, b)} |")
     print("\nRatios > 1x for throughput and < 1x for latency favour the Tailored BFT VDR.")
 
 
@@ -276,7 +306,7 @@ def burst_table(data, mixes, equal):
 
         def drain_cell(r):
             d, ci = b(r, "burst_drain_ms"), b(r, "burst_drain_ci_ms")
-            return None if d is None else (d, ci)
+            return None if d is None else (d, ci, b(r, "drain_ci_lo"), b(r, "drain_ci_hi"))
 
         td, idr = drain_cell(t), drain_cell(i)
         rows.append(f"| {label} | burst size (revocations) | "
@@ -284,6 +314,7 @@ def burst_table(data, mixes, equal):
         add(label, "steady offered load around the burst (ops/s)", offered(t), offered(i),
             lambda v: f"{v:.0f}", False)
         fmt_drain = lambda c: "—" if c is None else (
+            f"{c[0]:.0f} [{c[2]:.0f}, {c[3]:.0f}]" if c[2] is not None else
             f"{c[0]:.0f} ± {c[1]:.0f}" if c[1] is not None else f"{c[0]:.0f}")
         rows.append(f"| {label} | drain time, injection to last commit (ms) | {fmt_drain(td)} | "
                     f"{fmt_drain(idr)} | {ratio(td and td[0], idr and idr[0])} |")
@@ -312,7 +343,7 @@ def burst_table(data, mixes, equal):
           "the whole burst at a single instant on top of the steady stream (incident response: one "
           "issuer revoking many credentials at once). Burst latency is measured from that instant, "
           "so it includes queueing behind the rest of the burst; it is kept out of the steady-mix "
-          "percentiles above. Drain time is the mean over runs ± its 95% confidence half-width; "
+          "percentiles above. Drain time is the mean over runs with its 95% confidence interval; "
           "burst percentiles come from the burst's histogram merged over all runs. Both systems "
           "aggregate revocations before ordering them (same batching delay), so the transaction "
           "rows show what the burst cost in consensus instances.\n")
@@ -334,14 +365,28 @@ def main():
     ap.add_argument("--profile", default="")
     ap.add_argument("--cpus", default="")
     ap.add_argument("--equal-load", action="store_true")
+    ap.add_argument("--allow-unreportable", action="store_true",
+                    help="print anyway, marked NOT REPORTABLE (pipeline checks)")
     a = ap.parse_args()
     data = {"tailored": load(a.tailored), "indy": load(a.indy)}
+    problems = reportability(data)
+    if problems and not a.allow_unreportable:
+        print("refusing to build a reportable table (--allow-unreportable prints it, marked):",
+              file=sys.stderr)
+        for p in problems:
+            print(f"  {p}", file=sys.stderr)
+        sys.exit(2)
     measured = {m for d in data.values() for (m, _) in d}
     # The original four rows always show, so the table keeps its shape; register/update rows
     # only when some system measured them.
     mixes = [m for m in MIXES if m in MIXED or m in measured]
 
+    if problems:
+        print("> **NOT REPORTABLE.** " + "; ".join(problems) + ".\n")
     print("# Tailored BFT VDR vs Hyperledger Indy -- measured\n")
+    if any(num(r, "tput_ci_lo") is not None for d in data.values() for r in d.values()):
+        print("Brackets are 95% expanded BCa bootstrap intervals over independent repetitions, each on "
+              "a fresh cluster or ledger and a fresh JVM. Comparison tests are in STATS.md.\n")
     if a.equal_load:
         print(f"4 nodes x 1 vCPU each (capped and pinned), server vCPUs: {a.cpus or '?'}, "
               f"protocol profile: {a.profile or '?'}. Open-loop generator at the SAME fixed offered "
@@ -363,7 +408,8 @@ def main():
         print("\n> PROFILE=quick: short windows and 3 runs. Use these to check the pipeline, not as "
               "results. Re-run with PROFILE=standard or full.")
     print("\nFull per-row notes (batching, client configuration, admission path, per-operation "
-          "tables) are in the tailored-*-RESULTS.md and indy-*-RESULTS.md files next to this one.")
+          "tables) are in the tailored-*-RESULTS.md and indy-*-RESULTS.md files next to this one, or "
+          "for independent repetitions under reps/.")
 
 
 if __name__ == "__main__":

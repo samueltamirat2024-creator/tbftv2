@@ -137,6 +137,22 @@ tables.
 saturated (`bench/METRICS.md`, coordinated omission §2). Without that bound, a write-only mix past
 its knee would exhaust the generator's threads.
 
+## Independent repetitions and statistics
+
+`PROFILE=full` (or `REPEAT_FRESH=1` with any profile) gives each repetition its own fresh cluster or
+wiped ledger and its own generator JVM. It takes much longer per level, and it is the only form
+`bench/METRICS.md` treats as reportable: otherwise the runs share a cluster, and each adds 400 DIDs.
+
+```bash
+PROFILE=full ./measure-table.sh                # own operating points
+PROFILE=full EQUAL_LOAD=1 ./measure-table.sh   # equal load
+```
+
+The step-down decision uses the histogram merged over all repetitions of a level. A level that misses
+the target moves to `reps-rejected/`.
+
+`python3 test_stats.py` checks the statistics against known answers; run it before trusting them.
+
 ## 5. The one compromise on a 4 vCPU server
 
 Four nodes take all four vCPUs, so the load generator shares cores 0–3 with them. It is the same
@@ -158,6 +174,20 @@ results/table/<stamp>/
   <system>-<mix>-sweep.txt  every sweep level and its verdict (the evidence for the knee bracket)
   replica-logs/, indy-node-logs/
 ```
+
+With `REPEAT_FRESH=1`, the same folder also holds:
+
+| File | Contents |
+|---|---|
+| `STATS.md` | Intervals and comparison tests. Opens with **NOT REPORTABLE** and the reasons if any apply |
+| `reps/<system>/<mix>/<level>/rep-<k>/runs.jsonl` | That run's figures and full histograms |
+| `.../timeseries.jsonl` | The run second by second, warm-up included, for finding stalls |
+| `.../resources.tsv` | Per-container CPU, throttling, memory and disk I/O each second (cgroup v2) |
+| `reps-rejected/` | Levels that missed the p99 target and were stepped down from |
+| `provenance.txt` | Git commit and image IDs |
+
+`make-table.py` refuses to print a table with fewer than 10 runs or non-independent runs, unless given
+`--allow-unreportable`, which marks it. The runner passes that flag for every profile except `full`.
 
 ## Troubleshooting
 

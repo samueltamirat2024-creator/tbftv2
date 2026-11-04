@@ -57,6 +57,11 @@ case "$PROFILE" in
   full)     SWEEP_W=60000; SWEEP_S=60000; WARM=60000; STEADY=60000; RUNS=10; REFINE=3 ;;
   *) echo "PROFILE must be quick, standard or full" >&2; exit 2 ;;
 esac
+# REPEAT_FRESH=1: each of the RUNS repetitions gets its own fresh cluster or wiped ledger and its own
+# generator JVM, so runs are independent samples and stats.py can bootstrap over them. REPEAT_FRESH=0
+# runs them all on one cluster and JVM, with each run adding 400 DIDs: faster, but those runs are
+# correlated, and the tables and stats.py say so. The default for the reportable profile is 1.
+REPEAT_FRESH="${REPEAT_FRESH:-$( [ "$PROFILE" = full ] && echo 1 || echo 0 )}"
 # Coarse levels; the knee is then bisected REFINE times. Indy's knees on earlier hardware were
 # 50-75 (bursty-revoke) and 200-250 (read-heavy) ops/s; Tailored's were in the thousands.
 TAILORED_LEVELS="${TAILORED_LEVELS:-100,250,500,1000,1500,2000,3000,4000,6000,8000}"
@@ -115,6 +120,7 @@ REPLICAS=(vdr-replica-0 vdr-replica-1 vdr-replica-2 vdr-replica-3)
 NODES=(node1 node2 node3 node4)
 
 # ------------------------------------------------------------------ preflight
+[ "$REPEAT_FRESH" = 0 ] || [ "$RUNS" -ge 2 ] || { echo "REPEAT_FRESH=1 needs at least 2 runs" >&2; exit 2; }
 say "== measure-table $STAMP: profile $PROFILE, systems: $SYSTEMS, mixes: $MIXES$( [ "$EQUAL_LOAD" = 1 ] && echo ', EQUAL LOAD')"
 [ "$(uname -m)" = "x86_64" ] || say "WARNING: $(uname -m) host; the Indy (von-network) images are amd64 only"
 docker compose version >/dev/null 2>&1 || { echo "docker compose is required" >&2; exit 1; }
@@ -139,6 +145,12 @@ fi
 
 say "== building images (first time: several minutes)"
 "${COMPOSE[@]}" build >> "$LOG" 2>&1 || { echo "image build failed; see $LOG" >&2; exit 1; }
+# Provenance: exactly which code and images produced this table.
+{
+  echo "git: $(git rev-parse HEAD 2>/dev/null || echo unknown)$(git diff --quiet HEAD 2>/dev/null || echo ' (uncommitted changes)')"
+  "${COMPOSE[@]}" images --format json 2>/dev/null || "${COMPOSE[@]}" images
+  docker image inspect --format '{{.RepoTags}} {{.Id}}' vdr-bench 2>/dev/null || true
+} > "$OUT/provenance.txt"
 docker run --rm vdr-bench sh -c 'ls vdr-bftsmart/lib | grep -q bcprov && echo "Ed25519: BouncyCastle" || echo "Ed25519: JDK (bcprov not fetched)"' | tee -a "$LOG"
 
 # BFT-SMaRt replica keys (system.communication.defaultkeys=false): generated on this machine,
@@ -243,6 +255,17 @@ fresh_pool() {
 # FRESH_MEASURE=0 restores the single-invocation protocol (sweep and measurement on one cluster).
 FRESH_MEASURE="${FRESH_MEASURE:-1}"
 
+SAMPLER_PID=""
+start_sampler() {        # start_sampler <file>
+  python3 sample-resources.py --out "$1" >> "$LOG" 2>&1 &
+  SAMPLER_PID=$!
+}
+stop_sampler() {
+  [ -n "$SAMPLER_PID" ] && { kill "$SAMPLER_PID" 2>/dev/null || true; wait "$SAMPLER_PID" 2>/dev/null || true; }
+  SAMPLER_PID=""
+}
+trap stop_sampler EXIT
+
 mix_key() {              # mix_key <mix> -> the -Dbench.*.<key> suffix
   case "$1" in
     read-heavy) echo readHeavy ;; bursty-revoke) echo burstyRevoke ;; *) echo "$1" ;;
@@ -308,7 +331,89 @@ collect() {              # collect <tailored|indy> <tag> <mix>: file the measure
   say "   -> $run_dir"
 }
 
+# repeat_level <tailored|indy> <mix> <level> <java flags>: RUNS independent repetitions of one level,
+# filed under $OUT/reps/<system>/<mix>/<level>/rep-<k>/, one fresh state and JVM each.
+repeat_level() {
+  local sys="$1" mix="$2" level="$3" flags="$4" k rep tag status sub run_dir f
+  [ "$sys" = tailored ] && sub=tailored-bft || sub=indy
+  for (( k=1; k<=RUNS; k++ )); do
+    rep="$OUT/reps/$sys/$mix/$level/rep-$k"
+    tag="$STAMP-$sys-$mix-$level-$k"
+    mkdir -p "$rep"
+    say "-- $mix @ $level ops/s: repetition $k of $RUNS, fresh state"
+    fresh_state "$sys" || return 1
+    start_sampler "$rep/resources.tsv"
+    # The later -Dbench.runs overrides the one in BENCH_FLAGS. Registries: one run, plus slack.
+    bench_invoke "$sys" "$tag" measure "$rep/bench.log" 6 \
+        "-Dbench.runs=1 -Dbench.stepdown=false $flags" && status=0 || status=$?
+    stop_sampler
+    teardown "$sys" "$mix-$level-rep$k"
+    [ "$status" -eq 0 ] || { say "$sys $mix @ $level repetition $k failed (exit $status); see $rep/bench.log"; return 1; }
+    run_dir="$(latest_result "$sub" "$tag")" || { say "$sys: no result folder for tag $tag"; return 1; }
+    for f in runs.jsonl timeseries.jsonl rows.tsv environment.txt; do cp "$run_dir/$f" "$rep/"; done
+  done
+}
+
+measure_mix_repeated() { # measure_mix_repeated <tailored|indy> <mix>
+  local sys="$1" mix="$2" tag="$STAMP-$1-$2" key level levels status logf admitted ceiling path="" p99 k levels_arr dir
+  key="$(mix_key "$mix")"
+  mkdir -p "$OUT/bench-logs"
+  if [ "$EQUAL_LOAD" = 1 ]; then
+    case "$mix" in
+      read-heavy) levels="$EQ_READ_HEAVY" ;; bursty-revoke) levels="$EQ_BURSTY_REVOKE" ;;
+      register) levels="$EQ_REGISTER" ;; update) levels="$EQ_UPDATE" ;;
+    esac
+    IFS=, read -ra levels_arr <<<"$levels"
+    for level in "${levels_arr[@]}"; do
+      repeat_level "$sys" "$mix" "$level" "-Dbench.equalLoad.$key=$level $(pool_flag "$mix")" || return 1
+      python3 stats.py rows "$OUT/reps/$sys/$mix/$level" --equal-load --out "$OUT/$sys.tsv"
+    done
+    return
+  fi
+
+  say "-- $mix: sweep (fresh state)"
+  fresh_state "$sys" || return 1
+  logf="$OUT/bench-logs/$sys-$mix-sweep.log"
+  local nlev
+  if [ "$mix" = register ] || [ "$mix" = update ]; then
+    nlev=$(tr ',' '\n' <<<"$INDY_WRITE_LEVELS" | grep -c .)
+  else
+    nlev=$(tr ',' '\n' <<<"$INDY_LEVELS" | grep -c .)
+  fi
+  bench_invoke "$sys" "$tag-sweep" sweep "$logf" "$(( nlev + REFINE + 5 ))" \
+      "$(mix_flags "$sys" "$mix") -Dbench.sweepOnly=true" && status=0 || status=$?
+  teardown "$sys" "$mix-sweep"
+  [ "$status" -eq 0 ] || { say "$sys $mix sweep failed (exit $status); see $LOG"; return 1; }
+  admitted="$(grep -E "^ADMITTED $mix " "$logf" | tail -1 | awk '{print $3}')"
+  [ -n "$admitted" ] || { say "$sys $mix: the sweep admitted no level; see $logf"; return 1; }
+  ceiling="$(grep -E "^SATURATED_AT $mix " "$logf" | tail -1 | awk '{print $3}')"
+  grep -E "^    sweep:" "$logf" > "$OUT/$sys-$mix-sweep.txt" || true
+  IFS=, read -ra levels_arr <<<"$admitted"
+  say "   admitted: $admitted; first failing level: ${ceiling:-unknown}; $RUNS repetitions at the highest, stepping down if the merged p99 misses 500 ms"
+  for (( k=${#levels_arr[@]}-1; k>=0; k-- )); do
+    level="${levels_arr[$k]}"
+    dir="$OUT/reps/$sys/$mix/$level"
+    repeat_level "$sys" "$mix" "$level" \
+        "-Dbench.mixes=$mix -Dbench.admitted.$key=$level $(pool_flag "$mix") ${ceiling:+-Dbench.sweepCeiling=$ceiling}" || return 1
+    p99="$(python3 stats.py check-p99 "$dir")" && status=0 || status=$?
+    path="${path:+$path, }$level ops/s -> p99 $p99 ms"
+    if [ "$status" -eq 0 ]; then
+      python3 stats.py rows "$dir" --admission-path "$path" --out "$OUT/$sys.tsv"
+      return
+    elif [ "$status" -ne 3 ]; then
+      say "$sys $mix @ $level: stats.py failed (exit $status)"; return 1
+    fi
+    say "   $mix @ $level ops/s missed the p99 target over $RUNS repetitions ($p99 ms); stepping down"
+    # Kept for the record, but out of reps/, which holds only the levels that are reported.
+    mkdir -p "$OUT/reps-rejected/$sys/$mix"
+    mv "$dir" "$OUT/reps-rejected/$sys/$mix/$level"
+  done
+  say "$sys $mix: no admitted level met the p99 target over $RUNS repetitions (path $path)"
+  return 1
+}
+
 measure_mix() {          # measure_mix <tailored|indy> <mix>
+  [ "$REPEAT_FRESH" = 1 ] && { measure_mix_repeated "$1" "$2"; return; }
   local sys="$1" mix="$2" tag="$STAMP-$1-$2" key status logf admitted ceiling prior="" step k level
   key="$(mix_key "$mix")"
   mkdir -p "$OUT/bench-logs"
@@ -397,7 +502,16 @@ fi
 # ------------------------------------------------------------------ the table
 python3 make-table.py --profile "$PROFILE" --cpus "$TOTAL_CPUS" \
     $( [ "$EQUAL_LOAD" = 1 ] && echo --equal-load ) \
+    $( [ "$PROFILE" = full ] || echo --allow-unreportable ) \
     --tailored "$OUT/tailored.tsv" --indy "$OUT/indy.tsv" > "$OUT/TABLE.md"
+if [ "$REPEAT_FRESH" = 1 ]; then
+  ARMS=()
+  for sys in $SYSTEMS; do ARMS+=(--arm "$sys=$OUT/reps/$sys"); done
+  # Exit 4 means the report opens with why it is not reportable: wanted, not a failure here.
+  python3 stats.py report "${ARMS[@]}" --ref "${SYSTEMS##* }" $( [ "$EQUAL_LOAD" = 1 ] && echo --equal-load ) \
+      --out "$OUT/STATS.md" || [ $? -eq 4 ]
+  say "== statistics: $OUT/STATS.md"
+fi
 say ""
 cat "$OUT/TABLE.md" | tee -a "$LOG"
 say ""

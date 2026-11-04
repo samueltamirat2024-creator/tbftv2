@@ -10,6 +10,18 @@ STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT="/results/$STAMP"
 mkdir -p "$OUT"
 
+{
+  echo "# Environment (Hyperledger Indy baseline)"
+  echo "captured_utc: $STAMP"
+  echo "uname: $(uname -a)"
+  echo "runner vCPUs (container view): $(nproc)"
+  echo "cpu model: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ //')"
+  echo "memory: $(( $(awk '/MemTotal/{print $2}' /proc/meminfo) / 1024 )) MB"
+  echo "java: $(java -version 2>&1 | head -1)"
+  echo "JAVA_TOOL_OPTIONS: ${JAVA_TOOL_OPTIONS:-}"
+  echo "indy_vdr: $(python3 -c 'import importlib.metadata as m; print(m.version("indy-vdr"))' 2>/dev/null || echo unknown)"
+} > "$OUT/environment.txt"
+
 # ---------------------------------------------------------------- 1. pool readiness
 # The web server answers /genesis with 503 until it can reach the pool.
 GENESIS=/results/pool_transactions_genesis
@@ -66,6 +78,7 @@ cp "$REGISTRY_ENV" "$OUT/"
 [ "${BENCH_PHASE:-}" = sweep ] && { echo "sweep phase done. log in $OUT/bench.log"; exit 0; }
 cp RESULTS.md "$OUT/RESULTS.md"
 [ -f rows.tsv ] && cp rows.tsv "$OUT/rows.tsv"
+cp runs.jsonl timeseries.jsonl "$OUT/"
 # measure-table.sh looks for this to find the run it just started.
 [ -n "${RESULT_TAG:-}" ] && echo "$STAMP" > "/results/latest-$RESULT_TAG"
 

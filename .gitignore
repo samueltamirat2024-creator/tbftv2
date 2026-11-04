@@ -15,3 +15,6 @@ core.*
 
 # Per-replica private keys: generate on each machine, never commit (config/system.config).
 config/keys/privatekey*
+runs.jsonl
+timeseries.jsonl
+__pycache__/
