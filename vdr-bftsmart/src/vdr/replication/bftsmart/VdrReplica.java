@@ -118,12 +118,7 @@ public final class VdrReplica extends DefaultSingleRecoverable {
      */
     @Override
     public byte[] getSnapshot() {
-        if (!vdr.bench.JvmSampler.TIMING) return store.serialiseIdenticalProjection();
-        long started = System.nanoTime(), startedEpochMs = System.currentTimeMillis();
-        byte[] snapshot = store.serialiseIdenticalProjection();
-        System.out.printf("SNAPSHOT replica=%d epoch_ms=%d duration_us=%d bytes=%d%n", replicaId,
-                startedEpochMs, (System.nanoTime() - started) / 1000, snapshot.length);
-        return snapshot;
+        return store.serialiseIdenticalProjection();
     }
 
     @Override
@@ -166,7 +161,6 @@ public final class VdrReplica extends DefaultSingleRecoverable {
             System.out.printf("VDR replica %d BYZANTINE MODE: %s (fault injection; never in a "
                     + "measured run)%n", id, byzantine);
         }
-        vdr.bench.JvmSampler.start("replica-" + id);
         new VdrReplica(id, maxBatchSize, checkpointInterval, configDir, byzantine);
         System.out.printf("VDR replica %d ready%n", id);
         // ServiceReplica runs on its own threads; keep the process alive.

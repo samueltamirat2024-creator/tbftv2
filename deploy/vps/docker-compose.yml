@@ -64,6 +64,8 @@ x-vdr-replica: &vdr-replica
   # Each replica owns its vCPUs, as the Indy validators do: a replica sharing a core with the
   # ordering thread measures contention rather than consensus.
   cpus: ${REPLICA_CPUS:-1}
+  volumes:
+    - ../../config:/work/config:ro
   restart: unless-stopped
   environment:
     # The image compiled the module already; skip recompiling at every replica start.
@@ -147,36 +149,24 @@ services:
     command: ["./vdr-bftsmart/build.sh", "replica", "0", "/work/config"]
     cpuset: "${REPLICA0_CPUSET:-}"     # node1's cores (cpu-plan.sh)
     networks: { vdrnet: { ipv4_address: 172.28.0.31, aliases: [vdr-replica-0] } }
-    volumes:
-      - ${VDR_CONFIG_DIR:-../../config}:/work/config:ro
-      - replica0-data:/work/files
 
   vdr-replica-1:
     <<: *vdr-replica
     command: ["./vdr-bftsmart/build.sh", "replica", "1", "/work/config"]
     cpuset: "${REPLICA1_CPUSET:-}"     # node2's cores (cpu-plan.sh)
     networks: { vdrnet: { ipv4_address: 172.28.0.32, aliases: [vdr-replica-1] } }
-    volumes:
-      - ${VDR_CONFIG_DIR:-../../config}:/work/config:ro
-      - replica1-data:/work/files
 
   vdr-replica-2:
     <<: *vdr-replica
     command: ["./vdr-bftsmart/build.sh", "replica", "2", "/work/config"]
     cpuset: "${REPLICA2_CPUSET:-}"     # node3's cores (cpu-plan.sh)
     networks: { vdrnet: { ipv4_address: 172.28.0.33, aliases: [vdr-replica-2] } }
-    volumes:
-      - ${VDR_CONFIG_DIR:-../../config}:/work/config:ro
-      - replica2-data:/work/files
 
   vdr-replica-3:
     <<: *vdr-replica
     command: ["./vdr-bftsmart/build.sh", "replica", "3", "/work/config"]
     cpuset: "${REPLICA3_CPUSET:-}"     # node4's cores (cpu-plan.sh)
     networks: { vdrnet: { ipv4_address: 172.28.0.34, aliases: [vdr-replica-3] } }
-    volumes:
-      - ${VDR_CONFIG_DIR:-../../config}:/work/config:ro
-      - replica3-data:/work/files
 
   # The harness against the real cluster. Same generator, same metrics, same admission rule as
   # every other row -- only the replication layer differs (-Dvdr.replication=bftsmart).
@@ -192,7 +182,7 @@ services:
       VDR_BFTSMART_CONFIG: /work/config
     volumes:
       - ./results/tailored-bft:/work/artifact/results
-      - ${VDR_CONFIG_DIR:-../../config}:/work/config:ro
+      - ../../config:/work/config:ro
     depends_on: [vdr-replica-0, vdr-replica-1, vdr-replica-2, vdr-replica-3]
 
   # Measurement-only Tailored runner used by measure-table.sh: environment capture + vdr.bench.Bench
@@ -208,7 +198,7 @@ services:
       RESULT_TAG: ${RESULT_TAG:-}
     volumes:
       - ./results/tailored-bft:/results
-      - ${VDR_CONFIG_DIR:-../../config}:/work/config:ro
+      - ../../config:/work/config:ro
 
   # Indy baseline: probe, one-time registry setup, then the same vdr.bench.Bench harness.
   # The nofile limit comes from the shared x-bench anchor above.
@@ -242,9 +232,3 @@ volumes:
   node3-data:
   node4-data:
   webserver-ledger:
-  # BFT-SMaRt's disk log (/work/files): the same Docker volume storage as the Indy ledgers above, so
-  # the disk arms write to the same device. Unused by the in-memory arm; cluster_up removes them.
-  replica0-data:
-  replica1-data:
-  replica2-data:
-  replica3-data:

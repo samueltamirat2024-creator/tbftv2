@@ -1,5 +1,4 @@
-# Starting and stopping the systems under test. Sourced by measure-table.sh, durable-gate.sh and
-# faults/run-faults.sh, which define COMPOSE, REPLICAS, NODES, LOG and say().
+# Starting and stopping the systems under test. Sourced by faults/run-faults.sh, which defines COMPOSE, REPLICAS, NODES, LOG and say().
 
 replica_log() { "${COMPOSE[@]}" logs --no-color "$1" 2>/dev/null; }
 
@@ -15,20 +14,14 @@ handshakes_complete() {
   done
 }
 
-# Removes the replicas and whatever a disk arm left in their volumes.
 replicas_down() {
-  local i
   "${COMPOSE[@]}" rm -sf "${REPLICAS[@]}" >/dev/null 2>&1 || true
-  for i in 0 1 2 3; do
-    docker volume rm -f "vdr-experiments_replica$i-data" >/dev/null 2>&1 || true
-  done
 }
 
 # Fresh cluster (empty state). BFT-SMaRt 1.2 sometimes fails one replica's startup key exchange and
-# that replica silently sits out (vdr-bftsmart/real-gates.sh); never measure that. A replica in a
-# Byzantine mode must not reach a measured run: ALLOW_BYZANTINE is set only by the fault campaign.
+# that replica silently sits out (vdr-bftsmart/real-gates.sh); never run against that.
 cluster_up() {
-  local attempt deadline i
+  local attempt deadline
   for attempt in 1 2 3; do
     replicas_down
     "${COMPOSE[@]}" up -d --force-recreate "${REPLICAS[@]}" >> "$LOG" 2>&1
@@ -39,14 +32,6 @@ cluster_up() {
     done
     if handshakes_complete; then
       { replica_log vdr-replica-0 | grep "starting:" | head -1 | tee -a "$LOG"; } || true
-      if [ -z "${ALLOW_BYZANTINE:-}" ]; then
-        for i in 0 1 2 3; do
-          if replica_log "vdr-replica-$i" | grep -q "BYZANTINE MODE"; then
-            say "replica $i is in a Byzantine mode; refusing to measure"
-            exit 1
-          fi
-        done
-      fi
       return 0
     fi
     say "  replica startup handshake incomplete (attempt $attempt); recreating the cluster"

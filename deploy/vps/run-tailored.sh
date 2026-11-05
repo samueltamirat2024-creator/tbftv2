@@ -36,6 +36,5 @@ VDR_SKIP_BUILD=1 VDR_BFTSMART_CONFIG="$CONFIG" ./vdr-bftsmart/build.sh bench 4 2
 case "${BENCH_PHASE:-}" in sweep|history) echo "${BENCH_PHASE} phase done. log in $OUT/bench.log"; exit 0 ;; esac
 cp RESULTS.md "$OUT/RESULTS.md"
 cp rows.tsv "$OUT/rows.tsv"
-cp runs.jsonl timeseries.jsonl "$OUT/"
 [ -n "${RESULT_TAG:-}" ] && echo "$STAMP" > "/results/latest-$RESULT_TAG"
 echo "done. outputs in deploy/vps/results/tailored-bft/$STAMP"

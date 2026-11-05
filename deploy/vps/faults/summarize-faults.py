@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-One table per system from a fault campaign, using the same t intervals as stats.py.
+One table per system from a fault campaign, with t intervals for means.
 
     python3 summarize-faults.py results/faults/<stamp> [--out SUMMARY.md]
     python3 summarize-faults.py --restart-trials build/real-gates/<stamp>/restart-trials.csv
@@ -10,7 +10,6 @@ finish. Every count of "no violation" says how many valid runs it rests on.
 """
 import argparse
 import csv
-import importlib.util
 import json
 import math
 import statistics
@@ -18,9 +17,13 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
-_spec = importlib.util.spec_from_file_location("stats", Path(__file__).resolve().parent.parent / "stats.py")
-stats = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(stats)
+T95 = [12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262]   # two-sided, df = 1..9
+
+
+def t_halfwidth(values):
+    n = len(values)
+    t = T95[n - 2] if n - 2 < len(T95) else 1.96
+    return t * statistics.stdev(values) / math.sqrt(n)
 
 
 def wilson(successes, n, z=1.959964):
@@ -40,7 +43,7 @@ def mean_ci(values):
         return "—"
     if len(values) == 1:
         return f"{values[0]:.2f} (one run)"
-    return f"{statistics.fmean(values):.2f} ± {stats.t_halfwidth(values):.2f}"
+    return f"{statistics.fmean(values):.2f} ± {t_halfwidth(values):.2f}"
 
 
 def pct_interval(k, n):

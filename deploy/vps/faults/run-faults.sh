@@ -6,7 +6,7 @@
 #   REPS=1 SCENARIOS="crash-leader" SYSTEMS=tailored ./faults/run-faults.sh     a pilot
 #   HEALTHY_S=60 FAULT_S=60 HEALED_S=120                  the phases of one run (these are defaults)
 #
-# Scenarios per system. Crash-all needs state on disk, so the in-memory arm skips it. Byzantine
+# Scenarios per system. Crash-all needs state on disk, so Tailored, which logs in memory, skips it. Byzantine
 # behaviours exist only in this code base, so they are Tailored only (disclosed; patching Indy would
 # test the patch). See faults/README.md for what is not covered.
 #
@@ -29,7 +29,6 @@ scenarios_for() {
   [ -n "${SCENARIOS:-}" ] && { echo "$SCENARIOS"; return; }
   case "$1" in
     tailored)      echo "$NETWORK_SCENARIOS $BYZANTINE_SCENARIOS" ;;
-    tailored-disk) echo "crash-all" ;;
     indy)          echo "$NETWORK_SCENARIOS crash-all" ;;
   esac
 }
@@ -39,7 +38,6 @@ NODES=(node1 node2 node3 node4)
 BASE_COMPOSE=(docker compose --profile bftsmart --profile indy)
 GATES_COMPOSE=(docker compose -f docker-compose.yml -f docker-compose.gates.yml --profile bftsmart --profile indy)
 COMPOSE=("${BASE_COMPOSE[@]}")
-ALLOW_BYZANTINE=1
 # shellcheck disable=SC1091
 . ./cluster-lib.sh
 # shellcheck disable=SC1091
@@ -62,14 +60,12 @@ set_cluster_mode() {       # set_cluster_mode <system> <scenario>
   local i
   COMPOSE=("${BASE_COMPOSE[@]}")
   for i in 0 1 2 3; do unset "VDR_BYZANTINE_$i"; done
-  unset VDR_CONFIG_DIR
   case "$2" in
     byz-*)
       COMPOSE=("${GATES_COMPOSE[@]}")
       export VDR_BYZANTINE_1="$(byzantine_behaviour "$2")"
       ;;
   esac
-  [ "$1" = tailored-disk ] && { VDR_CONFIG_DIR="$(./arm-config.sh tailored-disk)"; export VDR_CONFIG_DIR; }
   return 0
 }
 
@@ -207,7 +203,7 @@ one_run() {                # one_run <system> <scenario> <repetition>
 
 trap 'replicas_down; docker compose stop "${NODES[@]}" >/dev/null 2>&1 || true' EXIT
 for system in $SYSTEMS; do
-  case "$system" in tailored|tailored-disk|indy) ;;
+  case "$system" in tailored|indy) ;;
     *) say "SYSTEMS: unknown system $system"; exit 2 ;; esac
   for scenario in $(scenarios_for "$system"); do
     for rep in $(seq 1 "$REPS"); do

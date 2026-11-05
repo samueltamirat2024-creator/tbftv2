@@ -75,9 +75,7 @@ Detach with `Ctrl-b d`, re-attach with `tmux attach -t bench`.
 | `full` | 60 s / 60 s | 60 s / 60 s | 10 | the paper's stated protocol |
 
 Other knobs:
-- `SYSTEMS="tailored tailored-disk indy"` is the default. Name a subset to run fewer arms, and keep `indy`
-  last: `STATS.md` compares each arm against the last one named. `tailored-disk` logs with
-  `sync_log=true`; `tailored-disk-nosync` does not sync. See "The disk arm" below.
+- `SYSTEMS=tailored` or `SYSTEMS=indy`: one system only.
 - `MIXES="register update"`: a subset of `read-heavy bursty-revoke register update`.
 - `TAILORED_LEVELS=...`, `INDY_LEVELS=...`: comma-separated sweep levels for the mixed workloads.
 - `TAILORED_WRITE_LEVELS=...`, `INDY_WRITE_LEVELS=...`: sweep levels for `register` and `update`.
@@ -94,23 +92,6 @@ marked SATURATED measures a queue.
 MIXES="register update" ./measure-table.sh                # each system at its own knee
 EQUAL_LOAD=1 MIXES="register update" ./measure-table.sh   # both systems at the same loads
 ```
-
-Set the levels from measured data with `EQ_FROM=results/table/<stamp>`: it uses about 50% and 80% of the
-Indy operating points in that table, and refuses if a mix is missing. For a reportable equal-load table:
-
-```bash
-PROFILE=full EQUAL_LOAD=1 EQ_FROM=results/table/<own-operating-point stamp> ./measure-table.sh
-```
-
-**The disk arm.** Indy keeps its ledger on disk, and the Tailored BFT VDR logs in memory. `tailored-disk`
-removes that difference. Before measuring it, the script runs `durable-gate.sh`, which kills all four replicas
-with SIGKILL and checks every acknowledged write. On BFT-SMaRt 1.2 **expect FAIL** (`docs/DURABILITY.md`), and the
-arm is then named "sync disk log, not recoverable" in every table. It still measures the cost of synchronous
-logging; it does not support any claim of crash recovery. Run `./indy-fsync-probe.sh` during a register load on
-Indy: if Indy does not sync per commit, `sync_log=true` is stricter than Indy, so also measure
-`tailored-disk-nosync` and report both.
-
-**Fault injection.** See `faults/README.md`.
 
 ## 4. What the script does
 
@@ -156,38 +137,6 @@ tables.
 saturated (`bench/METRICS.md`, coordinated omission §2). Without that bound, a write-only mix past
 its knee would exhaust the generator's threads.
 
-## Independent repetitions and statistics
-
-`PROFILE=full` (or `REPEAT_FRESH=1` with any profile) gives each repetition its own fresh cluster or
-wiped ledger and its own generator JVM. It takes much longer per level, and it is the only form
-`bench/METRICS.md` treats as reportable: otherwise the runs share a cluster, and each adds 400 DIDs.
-
-```bash
-PROFILE=full ./measure-table.sh                # own operating points
-PROFILE=full EQUAL_LOAD=1 ./measure-table.sh   # equal load
-```
-
-The step-down decision uses the histogram merged over all repetitions of a level. A level that misses
-the target moves to `reps-rejected/`.
-
-`python3 test_stats.py` checks the statistics against known answers; run it before trusting them.
-
-## Diagnosing the write tail and start-up stall
-
-```bash
-DIAG_PROFILE=quick DIAG_RUNS=2 DIAG_RATE_REGISTER=500 DIAG_RATE_UPDATE=500 ./diagnose.sh   # pilot first
-DIAG_RATE_REGISTER=500 DIAG_RATE_UPDATE=500 ./diagnose.sh                                  # the real one
-python3 diagnose.py results/diagnose/<stamp>
-```
-
-Pick rates each mix sustains, from a current table. Each configuration changes one thing against
-`baseline`; `diagnose.sh` lists them. `DIAGNOSIS.md` gives a verdict per cause by the rule at the top of
-`diagnose.py`, which needs both coincidence beyond chance and an intervention that helps. `overlay.tsv`
-holds each baseline run second by second with its events, for plotting. Pilot data is headed
-**NOT CONCLUSIVE**. These runs carry GC logging and timing, so their tables are not for reporting.
-
-`python3 test_diagnose.py` checks that the analysis finds a planted cause and rejects decoys.
-
 ## 5. The one compromise on a 4 vCPU server
 
 Four nodes take all four vCPUs, so the load generator shares cores 0–3 with them. It is the same
@@ -209,20 +158,6 @@ results/table/<stamp>/
   <system>-<mix>-sweep.txt  every sweep level and its verdict (the evidence for the knee bracket)
   replica-logs/, indy-node-logs/
 ```
-
-With `REPEAT_FRESH=1`, the same folder also holds:
-
-| File | Contents |
-|---|---|
-| `STATS.md` | Intervals and comparison tests. Opens with **NOT REPORTABLE** and the reasons if any apply |
-| `reps/<system>/<mix>/<level>/rep-<k>/runs.jsonl` | That run's figures and full histograms |
-| `.../timeseries.jsonl` | The run second by second, warm-up included, for finding stalls |
-| `.../resources.tsv` | Per-container CPU, throttling, memory and disk I/O each second (cgroup v2) |
-| `reps-rejected/` | Levels that missed the p99 target and were stepped down from |
-| `provenance.txt` | Git commit and image IDs |
-
-`make-table.py` refuses to print a table with fewer than 10 runs or non-independent runs, unless given
-`--allow-unreportable`, which marks it. The runner passes that flag for every profile except `full`.
 
 ## Troubleshooting
 

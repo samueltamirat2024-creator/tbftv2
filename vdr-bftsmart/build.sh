@@ -97,7 +97,6 @@ case "${1:-}" in
       -Dvdr.bftsmart.proxies="${VDR_GATES_PROXIES:-8}" \
       -Dvdr.clientIdBase="${VDR_CLIENT_ID_BASE:-1001}" \
       -Dvdr.gates.byzantine="${VDR_GATES_BYZANTINE:-}" \
-      -Dvdr.gates.ackFile="${VDR_GATES_ACK_FILE:-acks.txt}" \
       vdr.replication.bftsmart.RealGates "$@"
     ;;
   gates)

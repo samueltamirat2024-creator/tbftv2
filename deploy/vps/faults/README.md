@@ -27,7 +27,7 @@ same time as a measurement.
 | Scenario | Fault | Tailored | Indy |
 |---|---|---|---|
 | `crash-follower`, `crash-leader` | SIGKILL, restart at heal | yes | yes |
-| `crash-all` | SIGKILL all four, restart at heal | disk arm only: in memory loses everything by design | yes |
+| `crash-all` | SIGKILL all four, restart at heal | not on Tailored, which logs in memory and loses everything by design | yes |
 | `isolate-leader` | leader cut off from the whole subnet, both ways | yes | yes |
 | `partition-2-2` | no quorum on either side; clients reach everyone | yes | yes |
 | `delay-one`, `delay-all` | 200 ms ± 50 ms netem, on the leader or on all | yes | yes |
@@ -70,7 +70,7 @@ counts as evidence.
 ## Not yet run
 
 A one-repetition laptop run against real replica JVMs through a `docker` shim, with shortened phases, covered
-`crash-leader`, `client-kill`, `byz-stale-read`, `byz-forge-doc` and the `tailored-disk` `crash-all`. These are pipeline
+`crash-leader`, `client-kill`, `byz-stale-read` and `byz-forge-doc`. These are pipeline
 checks, not results. The shim records firewall rules without dropping a packet, so `partition-2-2` ran with no real
 partition; the checker now refuses that run.
 

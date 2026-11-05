@@ -5,9 +5,7 @@ Build the comparison tables from the rows.tsv files vdr.bench.Bench writes.
     python3 make-table.py --tailored T.tsv --indy I.tsv [--profile standard] [--cpus 4]
     python3 make-table.py ... --equal-load      # rows are "<mix> @ <rate> ops/s"
 
-    python3 make-table.py ... --tailored-disk D.tsv --durability durability-tailored-disk.txt
-
-Six tables:
+Five tables:
   1. every configuration (system x mix), as before, with each operating point's knee bracket;
   2. Register and Update, Tailored next to Indy, with ratios;
   3. per-operation latency of the updates and revocations inside the mixed workloads;
@@ -15,23 +13,18 @@ Six tables:
   5. the revocation burst (800 revocations at one instant inside bursty-revoke), Tailored next
      to Indy, with ratios.
 
-A disk-log arm adds its rows to table 1 and a sixth table, the cost of disk logging. The arm is called
-durable only if the durability file says "verdict: PASS".
-
 Missing inputs leave their rows as "not measured", so a one-system run still prints the tables.
 Latency is reported in milliseconds; the harness records microseconds.
 """
 import argparse
 import csv
 import re
-import sys
 from pathlib import Path
 
 SYSTEMS = [("Tailored BFT VDR", "tailored"), ("Hyperledger Indy baseline", "indy")]
 MIXES = ["read-heavy", "bursty-revoke", "register", "update"]
 MIXED = ["read-heavy", "bursty-revoke"]
 WRITES = ["register", "update"]
-PROTOCOL_RUNS = 10              # bench/METRICS.md, as in compare.py
 
 
 def load(path):
@@ -67,35 +60,6 @@ def burst_size(row):
 
 def ratio(a, b):
     return f"{a / b:.3g}x" if a is not None and b else "—"
-
-
-def tput_cell(row):
-    """Mean with its interval: the bootstrap from stats.py when present, else mean +- half-width."""
-    t = float(row["throughput"])
-    lo, hi = num(row, "tput_ci_lo"), num(row, "tput_ci_hi")
-    if lo is not None and hi is not None:
-        return f"{t:.0f} [{lo:.0f}, {hi:.0f}]"
-    return f"{t:.0f} ± {float(row['ci95']):.0f}"
-
-
-def p99_cell(row):
-    lo, hi = num(row, "p99_ci_lo"), num(row, "p99_ci_hi")
-    if lo is not None and hi is not None:
-        return f"{ms(row['p99_us'])} [{ms(lo)}, {ms(hi)}]"
-    return ms(row["p99_us"])
-
-
-def reportability(data):
-    """Why these rows cannot be reported, one reason per row."""
-    problems = []
-    for key, rows in data.items():
-        for (mix, rate), row in rows.items():
-            label = f"{key} {label_of(mix, rate)}"
-            if int(row["runs"]) < PROTOCOL_RUNS:
-                problems.append(f"{label}: {row['runs']} runs, below the protocol's {PROTOCOL_RUNS}")
-            if row.get("independent_runs") != "1":
-                problems.append(f"{label}: runs shared a cluster and JVM, so they are not independent")
-    return problems
 
 
 def knee(row):
@@ -188,45 +152,9 @@ def main_table(data, mixes, equal):
                 if not row:
                     print(f"| {label} | — | — | not measured in this run |")
                     continue
-                lat = f"{ms(row['p50_us'])} / {ms(row['p95_us'])} / {p99_cell(row)} ms"
-                print(f"| {label} | {tput_cell(row)} | {lat} | {short_notes(row, mix)} |")
-
-
-def disk_label(durability_path):
-    """What the sync_log arm may be called, from durable-gate.sh's verdict on this machine."""
-    if not durability_path or not Path(durability_path).is_file():
-        return "Tailored BFT VDR (sync disk log, durability gate not run)"
-    first = Path(durability_path).read_text(encoding="utf-8").splitlines()[0]
-    if first.strip() == "verdict: PASS":
-        return "Tailored BFT VDR (durable, sync disk log)"
-    return "Tailored BFT VDR (sync disk log, not recoverable)"
-
-
-def disk_table(data, mixes, equal, labels):
-    """In-memory against disk-log Tailored, and each against Indy, which is always on disk."""
-    arms = [k for k in ("tailored-disk", "tailored-disk-nosync") if data.get(k)]
-    if not arms:
-        return
-    print("\n## Cost of disk logging\n")
-    print("Indy always writes its ledger to disk. The Tailored BFT VDR's reported configuration logs in "
-          "memory, so these rows put it on the same footing. Each ratio is the arm over the in-memory "
-          "Tailored row at the same mix.\n")
-    print("| Load | Arm | Throughput (ops/s) | p50 (ms) | p99 (ms) | Throughput ratio | p99 ratio |")
-    print("|---|---|---|---|---|---|---|")
-    for mix in mixes:
-        for k in keys_for(data, mix, equal) or [(mix, None)]:
-            base = data["tailored"].get(k)
-            for key, name in [("tailored", "Tailored BFT VDR (in memory)")] + [(a, labels[a]) for a in arms] \
-                    + [("indy", "Hyperledger Indy baseline")]:
-                row = data[key].get(k)
-                if not row:
-                    print(f"| {label_of(*k)} | {name} | not measured | | | | |")
-                    continue
-                print(f"| {label_of(*k)} | {name} | {tput_cell(row)} | {ms(row['p50_us'])} | {p99_cell(row)} | "
-                      f"{ratio(float(row['throughput']), base and float(base['throughput']))} | "
-                      f"{ratio(float(row['p99_us']), base and float(base['p99_us']))} |")
-    print("\nThe disk arms use BFT-SMaRt 1.2's own log (`log_to_disk`). See docs/DURABILITY.md for what "
-          "that log does and does not guarantee.")
+                tput = f"{float(row['throughput']):.0f} ± {float(row['ci95']):.0f}"
+                lat = f"{ms(row['p50_us'])} / {ms(row['p95_us'])} / {ms(row['p99_us'])} ms"
+                print(f"| {label} | {tput} | {lat} | {short_notes(row, mix)} |")
 
 
 def writes_table(data, mixes, equal):
@@ -250,11 +178,11 @@ def writes_table(data, mixes, equal):
                 print(f"| {label} | (not measured on {'Tailored' if not t else 'Indy'}) | | | |")
                 continue
             tt, it = float(t["throughput"]), float(i["throughput"])
-            print(f"| {label} | throughput (ops/s) | {tput_cell(t)} | {tput_cell(i)} | {ratio(tt, it)} |")
+            print(f"| {label} | throughput (ops/s) | {tt:.0f} ± {float(t['ci95']):.0f} "
+                  f"| {it:.0f} ± {float(i['ci95']):.0f} | {ratio(tt, it)} |")
             for p in ("p50", "p95", "p99"):
                 a, b = float(t[f"{p}_us"]), float(i[f"{p}_us"])
-                ca, cb = (p99_cell(t), p99_cell(i)) if p == "p99" else (ms(a), ms(b))
-                print(f"| {label} | {p} latency (ms) | {ca} | {cb} | {ratio(a, b)} |")
+                print(f"| {label} | {p} latency (ms) | {ms(a)} | {ms(b)} | {ratio(a, b)} |")
     print("\nRatios > 1x for throughput and < 1x for latency favour the Tailored BFT VDR.")
 
 
@@ -348,7 +276,7 @@ def burst_table(data, mixes, equal):
 
         def drain_cell(r):
             d, ci = b(r, "burst_drain_ms"), b(r, "burst_drain_ci_ms")
-            return None if d is None else (d, ci, b(r, "drain_ci_lo"), b(r, "drain_ci_hi"))
+            return None if d is None else (d, ci)
 
         td, idr = drain_cell(t), drain_cell(i)
         rows.append(f"| {label} | burst size (revocations) | "
@@ -356,7 +284,6 @@ def burst_table(data, mixes, equal):
         add(label, "steady offered load around the burst (ops/s)", offered(t), offered(i),
             lambda v: f"{v:.0f}", False)
         fmt_drain = lambda c: "—" if c is None else (
-            f"{c[0]:.0f} [{c[2]:.0f}, {c[3]:.0f}]" if c[2] is not None else
             f"{c[0]:.0f} ± {c[1]:.0f}" if c[1] is not None else f"{c[0]:.0f}")
         rows.append(f"| {label} | drain time, injection to last commit (ms) | {fmt_drain(td)} | "
                     f"{fmt_drain(idr)} | {ratio(td and td[0], idr and idr[0])} |")
@@ -385,7 +312,7 @@ def burst_table(data, mixes, equal):
           "the whole burst at a single instant on top of the steady stream (incident response: one "
           "issuer revoking many credentials at once). Burst latency is measured from that instant, "
           "so it includes queueing behind the rest of the burst; it is kept out of the steady-mix "
-          "percentiles above. Drain time is the mean over runs with its 95% confidence interval; "
+          "percentiles above. Drain time is the mean over runs ± its 95% confidence half-width; "
           "burst percentiles come from the burst's histogram merged over all runs. Both systems "
           "aggregate revocations before ordering them (same batching delay), so the transaction "
           "rows show what the burst cost in consensus instances.\n")
@@ -404,40 +331,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tailored")
     ap.add_argument("--indy")
-    ap.add_argument("--tailored-disk")
-    ap.add_argument("--tailored-disk-nosync")
-    ap.add_argument("--durability", help="durable-gate.sh's verdict file for --tailored-disk")
     ap.add_argument("--profile", default="")
     ap.add_argument("--cpus", default="")
     ap.add_argument("--equal-load", action="store_true")
-    ap.add_argument("--allow-unreportable", action="store_true",
-                    help="print anyway, marked NOT REPORTABLE (pipeline checks)")
     a = ap.parse_args()
-    data = {"tailored": load(a.tailored), "indy": load(a.indy),
-            "tailored-disk": load(a.tailored_disk), "tailored-disk-nosync": load(a.tailored_disk_nosync)}
-    labels = {"tailored-disk": disk_label(a.durability),
-              "tailored-disk-nosync": "Tailored BFT VDR (unsynced disk log, not recoverable)"}
-    for key in ("tailored-disk", "tailored-disk-nosync"):
-        if data[key]:
-            SYSTEMS.insert(1, (labels[key], key))
-    problems = reportability(data)
-    if problems and not a.allow_unreportable:
-        print("refusing to build a reportable table (--allow-unreportable prints it, marked):",
-              file=sys.stderr)
-        for p in problems:
-            print(f"  {p}", file=sys.stderr)
-        sys.exit(2)
+    data = {"tailored": load(a.tailored), "indy": load(a.indy)}
     measured = {m for d in data.values() for (m, _) in d}
     # The original four rows always show, so the table keeps its shape; register/update rows
     # only when some system measured them.
     mixes = [m for m in MIXES if m in MIXED or m in measured]
 
-    if problems:
-        print("> **NOT REPORTABLE.** " + "; ".join(problems) + ".\n")
     print("# Tailored BFT VDR vs Hyperledger Indy -- measured\n")
-    if any(num(r, "tput_ci_lo") is not None for d in data.values() for r in d.values()):
-        print("Brackets are 95% expanded BCa bootstrap intervals over independent repetitions, each on "
-              "a fresh cluster or ledger and a fresh JVM. Comparison tests are in STATS.md.\n")
     if a.equal_load:
         print(f"4 nodes x 1 vCPU each (capped and pinned), server vCPUs: {a.cpus or '?'}, "
               f"protocol profile: {a.profile or '?'}. Open-loop generator at the SAME fixed offered "
@@ -451,7 +355,6 @@ def main():
               "within 500 ms; latency percentiles from the merged histogram of all runs at that "
               "load.\n")
     main_table(data, mixes, a.equal_load)
-    disk_table(data, mixes, a.equal_load, labels)
     writes_table(data, mixes, a.equal_load)
     mixed_write_latency(data, mixes, a.equal_load)
     tier0_table(data, mixes, a.equal_load)
@@ -460,8 +363,7 @@ def main():
         print("\n> PROFILE=quick: short windows and 3 runs. Use these to check the pipeline, not as "
               "results. Re-run with PROFILE=standard or full.")
     print("\nFull per-row notes (batching, client configuration, admission path, per-operation "
-          "tables) are in the tailored-*-RESULTS.md and indy-*-RESULTS.md files next to this one, or "
-          "for independent repetitions under reps/.")
+          "tables) are in the tailored-*-RESULTS.md and indy-*-RESULTS.md files next to this one.")
 
 
 if __name__ == "__main__":

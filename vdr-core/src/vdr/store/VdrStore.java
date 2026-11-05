@@ -33,8 +33,6 @@ public final class VdrStore implements VdrPolicy.View {
     private final List<VdrPolicy> policyChain = Policies.standard();
     private final int maxBatchSize;
     private final long checkpointInterval;
-    /** -Dvdr.timing=true: log each checkpoint for deploy/vps/diagnose.py; off in reported runs. */
-    private static final boolean TIMING = Boolean.getBoolean("vdr.timing");
 
     // ---- committed state (replica-identical) ------------------------------------
     private final TreeMap<String, Records.DidHead> heads = new TreeMap<>();
@@ -292,13 +290,7 @@ public final class VdrStore implements VdrPolicy.View {
 
     public synchronized void forceCheckpoint() {
         opsSinceCheckpoint = 0;
-        long started = TIMING ? System.nanoTime() : 0;
-        long startedEpochMs = TIMING ? System.currentTimeMillis() : 0;
         checkpoint = buildCheckpoint();
-        if (TIMING) {
-            System.out.printf("MERKLE replica=%d epoch_ms=%d duration_us=%d seq=%d%n", replicaId,
-                    startedEpochMs, (System.nanoTime() - started) / 1000, seq);
-        }
     }
 
     /**

@@ -28,5 +28,4 @@ services:
       <<: *gates-jvm
       VDR_BFTSMART_CONFIG: /work/config
     volumes:
-      - ${VDR_CONFIG_DIR:-../../config}:/work/config:ro
-      - ./results/gate-work:/gate
+      - ../../config:/work/config:ro

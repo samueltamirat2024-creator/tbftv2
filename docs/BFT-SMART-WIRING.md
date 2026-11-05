@@ -119,10 +119,9 @@ that was not recorded makes two runs incomparable.
 | `system.communication.defaultkeys` | **`false` before any reported run** | Paper 2 §III claims mutually authenticated channels; the shipped file says `true` for bring-up and says so in a comment |
 
 Do not modify BFT-SMaRt's ordering. The only permitted core touch-point is the Byzantine
-fault-injection adapter (plan §13), which must never run in a measured cluster. Three separate
+fault-injection adapter (plan §13), which must never run in a measured cluster. Two separate
 checks enforce that. `VdrReplica.main` refuses a Byzantine mode unless `VDR_FAULT_INJECTION=1`, which
-only `deploy/vps/docker-compose.gates.yml` sets. `measure-table.sh` aborts if a replica's log shows
-`BYZANTINE MODE`. `BftSmartCluster.assertNoByzantineInBenchmark()` refuses a generator JVM with
+only `deploy/vps/docker-compose.gates.yml` sets. `BftSmartCluster.assertNoByzantineInBenchmark()` refuses a generator JVM with
 `VDR_BYZANTINE` set; it cannot see inside a replica, and it is a no-op on the simulator.
 
 ## 6. Client-side choices worth knowing about
