@@ -51,7 +51,7 @@ MSG
       -Dindy.did="${INDY_SUBMITTER_DID:-V4SGRU86Z58d6TV7PBUe6f}" \
       -Dindy.revocRegDefId="$INDY_REVOC_REG_DEF_ID" \
       ${INDY_ENTRIES_PER_TXN:+-Dindy.entriesPerTxn=$INDY_ENTRIES_PER_TXN} \
-      vdr.bench.Bench "${2:-4}"
+      "${VDR_BENCH_MAIN:-vdr.bench.Bench}" "${2:-4}"
     ;;
   "")
     echo "compiled to $OUT"

@@ -86,6 +86,15 @@ public interface Replication extends AutoCloseable {
      */
     void checkpointEverywhere();
 
+    /**
+     * One replica's own checkpoint root and sequence number, unagreed, or null if it did not answer in
+     * time or this implementation cannot ask one replica. For convergence checks only: clients act on
+     * f+1-agreed roots.
+     */
+    default Reply rootOf(int replica, long waitMs) {
+        return null;
+    }
+
     /** Fails loudly if a benchmark image was built with fault injection enabled (plan §4). */
     default void assertNoByzantineInBenchmark() { }
 

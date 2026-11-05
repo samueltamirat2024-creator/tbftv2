@@ -182,6 +182,19 @@ interval on a percentile. Definitions of latency and throughput are unchanged.
 - **Invalid runs.** A run whose burst had failures, did not finish, or did not fire is excluded and
   named in the table. Excluding one drops the row below 10 runs, and so makes it not reportable.
 
+### Amendment, 2026-11-04: disk arm, equal load, faults (pending the sign-off below)
+
+- **Third arm.** `tailored-disk` logs through BFT-SMaRt with `sync_log=true`, so that Tailored can be
+  compared with Indy, which writes to disk. Its name in any table comes from `deploy/vps/durable-gate.sh`
+  on the machine that measured it. Unless that passes, it is "not recoverable" (`docs/DURABILITY.md`).
+- **Equal load** uses about 50% and 80% of Indy's measured operating point per mix
+  (`deploy/vps/equal-levels.py`), with a fresh cluster or ledger for every level and repetition.
+- **Fault runs are a separate experiment** (`deploy/vps/faults/`). They use `vdr.bench.History` at a low
+  fixed rate, not `vdr.bench.Bench`, and none of their latencies are comparable with the rows above.
+- **Harness change.** Indy's key-rotation seed now comes from the document rather than a counter, so
+  a fault run knows the next key before sending the write. This adds one SHA-256 of about 100 bytes to the
+  measured Indy update path. `Backend.resolve`, the measured read path, is unchanged on both systems.
+
 ## Sign-off
 
 | Role | Name | Date |

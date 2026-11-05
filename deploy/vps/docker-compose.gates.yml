@@ -6,6 +6,7 @@
 # tuning choice and does not apply to benchmark runs.
 x-gates-jvm: &gates-jvm
   JAVA_TOOL_OPTIONS: "-Xmx512m"
+  VDR_FAULT_INJECTION: "1"     # VdrReplica refuses a Byzantine mode without this
 
 services:
   vdr-replica-0:
@@ -27,4 +28,5 @@ services:
       <<: *gates-jvm
       VDR_BFTSMART_CONFIG: /work/config
     volumes:
-      - ../../config:/work/config:ro
+      - ${VDR_CONFIG_DIR:-../../config}:/work/config:ro
+      - ./results/gate-work:/gate

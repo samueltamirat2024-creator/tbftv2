@@ -105,7 +105,6 @@ public final class IndyBackend implements Backend {
     private final ConcurrentHashMap<String, Identity> identities = new ConcurrentHashMap<>();
     /** DIDs already written by populate in this process, in order. */
     private final List<String> population = new ArrayList<>();
-    private final AtomicLong keyRotations = new AtomicLong(1);
 
     private final List<String> pendingRevocations = new ArrayList<>();
     private final List<CompletableFuture<Void>> pendingFutures = new ArrayList<>();
@@ -385,8 +384,7 @@ public final class IndyBackend implements Backend {
             if (current == null) {
                 throw new IllegalStateException("update of a DID this backend never wrote: " + did);
             }
-            Identity next = Identity.fromSeed(current.did,
-                    sha256(salt + ":rot:" + current.did + ":" + keyRotations.getAndIncrement()));
+            Identity next = rotationOf(current.did, document);
             submitNym(current.did, current.privateKey, current.did, next.verkey, null).join();
             identities.put(did, next);
             if (!did.equals(current.did)) {
@@ -395,6 +393,12 @@ public final class IndyBackend implements Backend {
         } finally {
             lock.unlock();
         }
+    }
+
+    /** The next key follows from the document, so a fault run knows it before sending the write. */
+    private Identity rotationOf(String indyDid, byte[] document) {
+        return Identity.fromSeed(indyDid, sha256(salt + ":rot:" + indyDid + ":"
+                + Crypto.hex(Crypto.sha256(document))));
     }
 
     private final ConcurrentHashMap<String, java.util.concurrent.locks.ReentrantLock> didLocks =
@@ -430,6 +434,41 @@ public final class IndyBackend implements Backend {
             throw new IllegalStateException("GET_NYM found no NYM for " + indyDid
                     + " — a read of nothing must not count as a resolve");
         }
+    }
+
+    private static final java.util.regex.Pattern VERKEY =
+            java.util.regex.Pattern.compile("\\\\?\"verkey\\\\?\"\\s*:\\s*\\\\?\"([^\"\\\\]+)");
+
+    /** Indy has one read path: GET_NYM to a single node, with its state proof checked by indy-vdr. */
+    @Override public List<String> readLevels() {
+        return List.of("nym");
+    }
+
+    @Override public String observe(String did, int replicaHint, String level) {
+        Identity id = identities.get(did);
+        long req = vdr.buildGetNymRequest(submitterDid, id != null ? id.did : did);
+        String reply = vdr.poolSubmitRequest(pool, req).join();
+        if (reply == null || reply.isEmpty()) {
+            throw new IllegalStateException("empty GET_NYM reply for " + did);
+        }
+        if (reply.contains("\"data\":null")) {
+            return null;
+        }
+        java.util.regex.Matcher m = VERKEY.matcher(reply);
+        if (!m.find()) {
+            throw new IllegalStateException("GET_NYM reply has no verkey: " + reply);
+        }
+        return m.group(1);
+    }
+
+    /** Indy's update stores a key, not the document, so the observable value is that key. */
+    @Override public String writeValue(String did, byte[] document) {
+        return rotationOf(identities.get(did).did, document).verkey;
+    }
+
+    @Override public long observeRevokedCount() {
+        RegistryState state = fetchRegistryState();
+        return state == null ? -1 : state.revokedCount();
     }
 
     @Override public String registryIdFor(String did) {

@@ -75,7 +75,7 @@ cp "$REGISTRY_ENV" "$OUT/"
 ./indy-baseline/build.sh bench 4 2>&1 | tee "$OUT/bench.log"
 # A sweep-only phase (measure-table.sh) measures nothing and writes no RESULTS.md; copying the
 # one already in /work would file a stale result under this run's stamp.
-[ "${BENCH_PHASE:-}" = sweep ] && { echo "sweep phase done. log in $OUT/bench.log"; exit 0; }
+case "${BENCH_PHASE:-}" in sweep|history) echo "${BENCH_PHASE} phase done. log in $OUT/bench.log"; exit 0 ;; esac
 cp RESULTS.md "$OUT/RESULTS.md"
 [ -f rows.tsv ] && cp rows.tsv "$OUT/rows.tsv"
 cp runs.jsonl timeseries.jsonl "$OUT/"

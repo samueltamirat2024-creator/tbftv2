@@ -1,0 +1,4 @@
+# The same network tools for both systems, kept out of the images under test.
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends iproute2 iptables \
+ && rm -rf /var/lib/apt/lists/*

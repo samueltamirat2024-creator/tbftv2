@@ -25,7 +25,7 @@ import vdr.store.VdrStore;
  * recovering replica needs in order to catch up without replaying from genesis.
  *
  * <p><b>Fault injection (real-engine M6 only).</b> {@code VDR_BYZANTINE=<Behaviour>} (or
- * {@code -Dvdr.byzantine}) makes this replica run the simulator's Byzantine behaviours from
+ * {@code -Dvdr.byzantine}), with {@code VDR_FAULT_INJECTION=1}, makes this replica run the simulator's Byzantine behaviours from
  * {@link ServiceReplica} on top of real ordering. Unset, the honest path below is the only code
  * that runs. The compose file never sets it; only {@code deploy/vps/docker-compose.gates.yml}
  * does, and the replica announces it on stdout so a run's logs show which replica lied.
@@ -152,6 +152,12 @@ public final class VdrReplica extends DefaultSingleRecoverable {
         ServiceReplica.Behaviour byzantine = fault == null || fault.isBlank()
                 ? null : ServiceReplica.Behaviour.valueOf(fault.trim().toUpperCase());
 
+        if (byzantine != null && byzantine != ServiceReplica.Behaviour.HONEST
+                && !"1".equals(System.getenv("VDR_FAULT_INJECTION"))) {
+            System.err.printf("refusing Byzantine mode %s without VDR_FAULT_INJECTION=1, which only "
+                    + "deploy/vps/docker-compose.gates.yml sets%n", byzantine);
+            System.exit(2);
+        }
         System.out.printf("VDR replica %d starting: config=%s, maxBatchSize=%d, "
                         + "merkleCheckpointInterval=%d ops, Ed25519=%s, vCPUs=%d, maxHeap=%d MB%n",
                 id, configDir, maxBatchSize, checkpointInterval, vdr.crypto.Crypto.ed25519Provider(),

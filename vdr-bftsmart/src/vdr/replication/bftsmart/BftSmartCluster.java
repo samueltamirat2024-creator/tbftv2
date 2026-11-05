@@ -120,6 +120,18 @@ public final class BftSmartCluster implements Replication {
 
     @Override public boolean simulated() { return false; }
 
+    /**
+     * Catches a generator started with fault injection set. Replicas are guarded separately:
+     * {@code VdrReplica.main} refuses a Byzantine mode unless VDR_FAULT_INJECTION=1, which only the
+     * gates overlay sets, and measure-table.sh checks their logs before it measures.
+     */
+    @Override public void assertNoByzantineInBenchmark() {
+        String fault = System.getProperty("vdr.byzantine", System.getenv("VDR_BYZANTINE"));
+        if (fault != null && !fault.isBlank()) {
+            throw new IllegalStateException("VDR_BYZANTINE=" + fault + " in a benchmark process");
+        }
+    }
+
     @Override public String describe() {
         return String.format("BFT-SMaRt (n=%d, f=%d, config=%s, %d proxies + 1 root-gossip proxy, "
                 + "root refresh %d ms + on demand)", n, f, configDir, allProxies.size() - 1, rootRefreshMs);
@@ -258,7 +270,7 @@ public final class BftSmartCluster implements Replication {
      *
      * @return the reply, or null if the replica did not answer within {@code waitMs}
      */
-    public Reply rootOf(int replica, long waitMs) {
+    @Override public Reply rootOf(int replica, long waitMs) {
         List<Reply> replies = invoke(Codec.encode(Op.root("root")), allTargets(), new int[] {replica},
                 TOMMessageType.UNORDERED_REQUEST, 1, waitMs);
         return replies.isEmpty() ? null : replies.get(0);

@@ -4,7 +4,7 @@
 #   ./measure-table.sh                     # both systems, all four mixes, PROFILE=standard
 #   PROFILE=quick ./measure-table.sh       # pipeline check; numbers NOT reportable
 #   PROFILE=full  ./measure-table.sh       # the paper's protocol: 60 s / 60 s / 10 runs (many hours)
-#   SYSTEMS=tailored ./measure-table.sh    # only one system (tailored | indy)
+#   SYSTEMS=tailored ./measure-table.sh    # one arm: tailored | tailored-disk | tailored-disk-nosync | indy
 #   MIXES="register update" ./measure-table.sh   # only the two VDR write operations
 #   EQUAL_LOAD=1 ./measure-table.sh        # every mix at the SAME fixed offered loads on both
 #
@@ -40,7 +40,10 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 PROFILE="${PROFILE:-standard}"
-SYSTEMS="${SYSTEMS:-tailored indy}"
+# tailored keeps its log in memory; Indy writes its ledger to disk. tailored-disk removes that
+# difference by logging with sync_log=true, and durable-gate.sh decides what it may be called.
+# tailored-disk-nosync is for when indy-fsync-probe.sh shows Indy does not sync per commit.
+SYSTEMS="${SYSTEMS:-tailored tailored-disk indy}"
 DELAY_MS="${VDR_MAX_BATCH_DELAY_MS:-50}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT="results/table/$STAMP${OUT_LABEL:+-$OUT_LABEL}"
@@ -80,6 +83,8 @@ UPDATE_DID_POOL="${UPDATE_DID_POOL:-400}"
 # EQUAL_LOAD=1: no sweep; every listed level is measured on both systems with the full RUNS.
 # Pick loads BOTH systems sustain: a level past Indy's knee compares Tailored with Indy's queue.
 EQUAL_LOAD="${EQUAL_LOAD:-0}"
+# Check these against a measured Indy table, or use EQ_FROM below: a level past Indy's knee compares
+# Tailored with Indy's queue.
 EQ_READ_HEAVY="${EQ_READ_HEAVY:-50,100,200}"
 EQ_BURSTY_REVOKE="${EQ_BURSTY_REVOKE:-25,50}"
 EQ_REGISTER="${EQ_REGISTER:-10,25,50}"
@@ -101,9 +106,9 @@ mix_flags() {
     return
   fi
   case "$sys:$mix" in
-    tailored:register|tailored:update) levels="$TAILORED_WRITE_LEVELS" ;;
+    tailored*:register|tailored*:update) levels="$TAILORED_WRITE_LEVELS" ;;
     indy:register|indy:update)         levels="$INDY_WRITE_LEVELS" ;;
-    tailored:*)                        levels="$TAILORED_LEVELS" ;;
+    tailored*:*)                       levels="$TAILORED_LEVELS" ;;
     indy:*)                            levels="$INDY_LEVELS" ;;
   esac
   echo "-Dbench.mixes=$mix -Dbench.levels=$levels$pool"
@@ -111,7 +116,17 @@ mix_flags() {
 
 BENCH_FLAGS="-Xms1g -Xmx2g -Dbench.warmupMs=$WARM -Dbench.steadyMs=$STEADY -Dbench.runs=$RUNS \
  -Dbench.sweepWarmupMs=$SWEEP_W -Dbench.sweepSteadyMs=$SWEEP_S -Dbench.refine=$REFINE ${BENCH_EXTRA_FLAGS:-}"
+# EQ_FROM=<table dir>: equal-load levels at about 50% and 80% of the Indy operating points measured there.
+if [ -n "${EQ_FROM:-}" ]; then
+  eval "$(python3 equal-levels.py "$EQ_FROM/indy.tsv")" || { echo "EQ_FROM: no usable levels" >&2; exit 2; }
+fi
 MIXES="${MIXES:-read-heavy bursty-revoke register update}"
+for ARM in $SYSTEMS; do
+  case "$ARM" in tailored|tailored-disk|tailored-disk-nosync|indy) ;;
+    *) echo "SYSTEMS: unknown arm '$ARM'" >&2; exit 2 ;;
+  esac
+done
+is_tailored() { [[ "$1" == tailored* ]]; }
 for MIX in $MIXES; do
   case "$MIX" in read-heavy|bursty-revoke|register|update) ;;
     *) echo "MIXES: unknown mix '$MIX' (read-heavy bursty-revoke register update)" >&2; exit 2 ;;
@@ -170,40 +185,8 @@ if grep -Eq '^system\.communication\.defaultkeys *= *false' "$CFG/system.config"
 fi
 
 # ------------------------------------------------------------------ helpers
-replica_log() { "${COMPOSE[@]}" logs --no-color "$1" 2>/dev/null; }
-
-handshakes_complete() {
-  local i j text
-  for i in 0 1 2 3; do
-    text="$(replica_log "vdr-replica-$i")"
-    grep -qF "VDR replica $i ready" <<<"$text" || return 1
-    for j in 0 1 2 3; do
-      [ "$i" = "$j" ] && continue
-      grep -qF "Diffie-Hellman complete with $j" <<<"$text" || return 1
-    done
-  done
-}
-
-# Fresh cluster (empty in-memory state). BFT-SMaRt 1.2 sometimes fails one replica's startup key
-# exchange and that replica silently sits out (vdr-bftsmart/real-gates.sh); never measure that.
-cluster_up() {
-  local attempt deadline
-  for attempt in 1 2 3; do
-    "${COMPOSE[@]}" rm -sf "${REPLICAS[@]}" >/dev/null 2>&1 || true
-    "${COMPOSE[@]}" up -d --force-recreate "${REPLICAS[@]}" >> "$LOG" 2>&1
-    deadline=$((SECONDS + 180))
-    until handshakes_complete; do
-      [ $SECONDS -gt $deadline ] && break
-      sleep 3
-    done
-    if handshakes_complete; then
-      { replica_log vdr-replica-0 | grep "starting:" | head -1 | tee -a "$LOG"; } || true
-      return 0
-    fi
-    say "  replica startup handshake incomplete (attempt $attempt); recreating the cluster"
-  done
-  return 1
-}
+# shellcheck disable=SC1091
+. ./cluster-lib.sh
 
 save_replica_logs() {    # save_replica_logs <label>
   mkdir -p "$OUT/replica-logs/$1"
@@ -221,33 +204,6 @@ latest_result() {        # latest_result <results subdir> <tag> -> path of that 
 # Appends a run's rows.tsv (minus the header after the first) to a per-system file.
 append_rows() {          # append_rows <rows.tsv> <dest>
   if [ -s "$2" ]; then tail -n +2 "$1" >> "$2"; else cp "$1" "$2"; fi
-}
-
-# ------------------------------------------------------------------ Hyperledger Indy pool
-# fresh_pool: wipe the ledger, start the four validators, fetch the genesis file, stop the ledger
-# browser.
-fresh_pool() {
-  "${COMPOSE[@]}" rm -sf "${REPLICAS[@]}" >/dev/null 2>&1 || true
-  docker compose down -v >> "$LOG" 2>&1 || true
-  # Containers write these as root; delete them from a container so ownership never blocks it.
-  docker run --rm -v "$PWD/results/indy":/results vdr-bench \
-      rm -f /results/registry.env /results/registries.env /results/registry.counter \
-            /results/pool_transactions_genesis >> "$LOG" 2>&1
-  docker compose up -d "${NODES[@]}" webserver >> "$LOG" 2>&1
-  echo -n "   waiting for the pool " | tee -a "$LOG"
-  local i
-  for i in $(seq 1 120); do
-    if curl -fsS "http://127.0.0.1:${WEB_SERVER_HOST_PORT:-9000}/genesis" \
-         -o results/indy/pool_transactions_genesis 2>/dev/null \
-       && [ -s results/indy/pool_transactions_genesis ]; then
-      say " ready after $((i * 10)) s"; break
-    fi
-    echo -n "."; sleep 10
-    [ "$i" -eq 120 ] && { say " pool not ready after 20 min; docker compose logs webserver"; return 1; }
-  done
-  # The ledger browser is only needed for the genesis file. Left running it keeps reading the
-  # ledger and competes with the validators for CPU during the measurement.
-  docker compose stop webserver >> "$LOG" 2>&1
 }
 
 # ------------------------------------------------------------------ one system, one mix
@@ -279,7 +235,7 @@ mix_key() {              # mix_key <mix> -> the -Dbench.*.<key> suffix
 pool_flag() { [ "$1" = update ] && echo "-Dbench.didPool=$UPDATE_DID_POOL" || true; }
 
 fresh_state() {          # fresh_state <tailored|indy>
-  if [ "$1" = tailored ]; then
+  if is_tailored "$1"; then
     cluster_up || { say "the BFT-SMaRt cluster never started cleanly; see $LOG"; return 1; }
   else
     fresh_pool
@@ -287,9 +243,9 @@ fresh_state() {          # fresh_state <tailored|indy>
 }
 
 teardown() {             # teardown <tailored|indy> <label>: keep the node logs, stop the nodes
-  if [ "$1" = tailored ]; then
-    save_replica_logs "tailored-$2"
-    "${COMPOSE[@]}" rm -sf "${REPLICAS[@]}" >/dev/null 2>&1 || true
+  if is_tailored "$1"; then
+    save_replica_logs "$1-$2"
+    replicas_down
   else
     mkdir -p "$OUT/indy-node-logs/$2"
     local nd
@@ -305,7 +261,7 @@ teardown() {             # teardown <tailored|indy> <label>: keep the node logs,
 bench_invoke() {
   local sys="$1" tag="$2" phase="$3" logf="$4" regs="$5" flags="$6" status
   set +e
-  if [ "$sys" = tailored ]; then
+  if is_tailored "$sys"; then
     "${COMPOSE[@]}" run --rm --no-deps -T \
         -e RESULT_TAG="$tag" -e BENCH_PHASE="$phase" \
         -e JAVA_TOOL_OPTIONS="$BENCH_FLAGS -Dvdr.maxBatchDelayMs=$DELAY_MS $flags" \
@@ -328,11 +284,11 @@ bench_invoke() {
 
 collect() {              # collect <tailored|indy> <tag> <mix>: file the measured run's outputs
   local sub run_dir
-  [ "$1" = tailored ] && sub=tailored-bft || sub=indy
+  is_tailored "$1" && sub=tailored-bft || sub=indy
   run_dir="$(latest_result "$sub" "$2")" || { say "$1 $3: no result folder for tag $2"; return 1; }
   append_rows "$run_dir/rows.tsv" "$OUT/$1.tsv"
   cp "$run_dir/RESULTS.md" "$OUT/$1-$3-RESULTS.md"
-  [ "$1" = tailored ] && cp "$run_dir/environment.txt" "$OUT/tailored-environment.txt"
+  is_tailored "$1" && cp "$run_dir/environment.txt" "$OUT/$1-environment.txt"
   say "   -> $run_dir"
 }
 
@@ -340,7 +296,7 @@ collect() {              # collect <tailored|indy> <tag> <mix>: file the measure
 # filed under $OUT/reps/<system>/<mix>/<level>/rep-<k>/, one fresh state and JVM each.
 repeat_level() {
   local sys="$1" mix="$2" level="$3" flags="$4" k rep tag status sub run_dir f
-  [ "$sys" = tailored ] && sub=tailored-bft || sub=indy
+  is_tailored "$sys" && sub=tailored-bft || sub=indy
   for (( k=1; k<=RUNS; k++ )); do
     rep="$OUT/reps/$sys/$mix/$level/rep-$k"
     tag="$STAMP-$sys-$mix-$level-$k"
@@ -492,14 +448,34 @@ measure_mix() {          # measure_mix <tailored|indy> <mix>
 }
 
 # ------------------------------------------------------------------ Tailored BFT VDR
-if [[ " $SYSTEMS " == *" tailored "* ]]; then
+# use_arm <arm>: replicas and generator read this arm's config. A disk arm's name in the table comes
+# from durable-gate.sh on this machine, so the gate runs first (SKIP_DURABILITY_GATE=1 to reuse a
+# verdict, which must then be copied to $OUT/durability-<arm>.txt by hand).
+use_arm() {
+  case "$1" in
+    tailored) export VDR_CONFIG_DIR="$CFG" ;;
+    *)
+      VDR_CONFIG_DIR="$(ARM_CONFIG_BASE="$CFG" ./arm-config.sh "$1")" || return 1
+      export VDR_CONFIG_DIR
+      if [ "$1" = tailored-disk ] && [ -z "${SKIP_DURABILITY_GATE:-}" ]; then
+        say "== durability gate for $1 (kill -9 of all replicas)"
+        ARM_CONFIG_BASE="$CFG" ARM="$1" ./durable-gate.sh "$OUT/durability-$1.txt" && say "   PASS" \
+          || say "   FAIL: this arm is reported as disk logging, not recoverable"
+      fi
+      ;;
+  esac
+}
+
+for ARM in $SYSTEMS; do
+  is_tailored "$ARM" || continue
   say ""
-  say "== Tailored BFT VDR: 4 BFT-SMaRt replicas x 1 vCPU (cores ${REPLICA0_CPUSET},${REPLICA1_CPUSET},${REPLICA2_CPUSET},${REPLICA3_CPUSET})"
+  say "== $ARM: 4 BFT-SMaRt replicas x 1 vCPU (cores ${REPLICA0_CPUSET},${REPLICA1_CPUSET},${REPLICA2_CPUSET},${REPLICA3_CPUSET})"
   "${COMPOSE[@]}" stop "${NODES[@]}" webserver >/dev/null 2>&1 || true
+  use_arm "$ARM" || { say "could not set up arm $ARM"; exit 1; }
   for MIX in $MIXES; do
-    measure_mix tailored "$MIX" || exit 1
+    measure_mix "$ARM" "$MIX" || exit 1
   done
-fi
+done
 
 # ------------------------------------------------------------------ Hyperledger Indy
 if [[ " $SYSTEMS " == *" indy "* ]]; then
@@ -513,8 +489,10 @@ fi
 # ------------------------------------------------------------------ the table
 python3 make-table.py --profile "$PROFILE" --cpus "$TOTAL_CPUS" \
     $( [ "$EQUAL_LOAD" = 1 ] && echo --equal-load ) \
-    $( [ "$PROFILE" = full ] || echo --allow-unreportable ) \
-    --tailored "$OUT/tailored.tsv" --indy "$OUT/indy.tsv" > "$OUT/TABLE.md"
+    $( [ "$PROFILE" = full ] && [ -z "${ALLOW_UNREPORTABLE:-}" ] || echo --allow-unreportable ) \
+    --tailored "$OUT/tailored.tsv" --indy "$OUT/indy.tsv" \
+    --tailored-disk "$OUT/tailored-disk.tsv" --durability "$OUT/durability-tailored-disk.txt" \
+    --tailored-disk-nosync "$OUT/tailored-disk-nosync.tsv" > "$OUT/TABLE.md"
 if [ "$REPEAT_FRESH" = 1 ]; then
   ARMS=()
   for sys in $SYSTEMS; do ARMS+=(--arm "$sys=$OUT/reps/$sys"); done

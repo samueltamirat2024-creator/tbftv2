@@ -79,7 +79,7 @@ for config in $DIAG_CONFIGS; do
   REPLICA_JAVA_OPTS="$replica_heap $replica_extra $LOGGING" \
   BENCH_EXTRA_FLAGS="$bench_extra -Xlog:gc,safepoint:stdout:time,level,tags -Dvdr.timing=true" \
   PRELOAD_SEPARATE_MS="$preload" RUNS_OVERRIDE="$runs" STEADY_OVERRIDE="$steady" OUT_LABEL="$label" \
-  SYSTEMS=tailored MIXES="$mixes" EQUAL_LOAD=1 REPEAT_FRESH=1 PROFILE="$DIAG_PROFILE" \
+  ALLOW_UNREPORTABLE=1 SYSTEMS=tailored MIXES="$mixes" EQUAL_LOAD=1 REPEAT_FRESH=1 PROFILE="$DIAG_PROFILE" \
   EQ_REGISTER="$DIAG_RATE_REGISTER" EQ_UPDATE="$DIAG_RATE_UPDATE" \
     ./measure-table.sh
   printf '%s\t%s\t%s\t%s\n' "$config" "$(ls -d results/table/*-"$label" | tail -1)" \

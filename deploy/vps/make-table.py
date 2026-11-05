@@ -5,13 +5,18 @@ Build the comparison tables from the rows.tsv files vdr.bench.Bench writes.
     python3 make-table.py --tailored T.tsv --indy I.tsv [--profile standard] [--cpus 4]
     python3 make-table.py ... --equal-load      # rows are "<mix> @ <rate> ops/s"
 
-Five tables:
+    python3 make-table.py ... --tailored-disk D.tsv --durability durability-tailored-disk.txt
+
+Six tables:
   1. every configuration (system x mix), as before, with each operating point's knee bracket;
   2. Register and Update, Tailored next to Indy, with ratios;
   3. per-operation latency of the updates and revocations inside the mixed workloads;
   4. the Tier-0 fallback rate (F of N reads) of the Tailored BFT VDR in the mixed workloads;
   5. the revocation burst (800 revocations at one instant inside bursty-revoke), Tailored next
      to Indy, with ratios.
+
+A disk-log arm adds its rows to table 1 and a sixth table, the cost of disk logging. The arm is called
+durable only if the durability file says "verdict: PASS".
 
 Missing inputs leave their rows as "not measured", so a one-system run still prints the tables.
 Latency is reported in milliseconds; the harness records microseconds.
@@ -185,6 +190,43 @@ def main_table(data, mixes, equal):
                     continue
                 lat = f"{ms(row['p50_us'])} / {ms(row['p95_us'])} / {p99_cell(row)} ms"
                 print(f"| {label} | {tput_cell(row)} | {lat} | {short_notes(row, mix)} |")
+
+
+def disk_label(durability_path):
+    """What the sync_log arm may be called, from durable-gate.sh's verdict on this machine."""
+    if not durability_path or not Path(durability_path).is_file():
+        return "Tailored BFT VDR (sync disk log, durability gate not run)"
+    first = Path(durability_path).read_text(encoding="utf-8").splitlines()[0]
+    if first.strip() == "verdict: PASS":
+        return "Tailored BFT VDR (durable, sync disk log)"
+    return "Tailored BFT VDR (sync disk log, not recoverable)"
+
+
+def disk_table(data, mixes, equal, labels):
+    """In-memory against disk-log Tailored, and each against Indy, which is always on disk."""
+    arms = [k for k in ("tailored-disk", "tailored-disk-nosync") if data.get(k)]
+    if not arms:
+        return
+    print("\n## Cost of disk logging\n")
+    print("Indy always writes its ledger to disk. The Tailored BFT VDR's reported configuration logs in "
+          "memory, so these rows put it on the same footing. Each ratio is the arm over the in-memory "
+          "Tailored row at the same mix.\n")
+    print("| Load | Arm | Throughput (ops/s) | p50 (ms) | p99 (ms) | Throughput ratio | p99 ratio |")
+    print("|---|---|---|---|---|---|---|")
+    for mix in mixes:
+        for k in keys_for(data, mix, equal) or [(mix, None)]:
+            base = data["tailored"].get(k)
+            for key, name in [("tailored", "Tailored BFT VDR (in memory)")] + [(a, labels[a]) for a in arms] \
+                    + [("indy", "Hyperledger Indy baseline")]:
+                row = data[key].get(k)
+                if not row:
+                    print(f"| {label_of(*k)} | {name} | not measured | | | | |")
+                    continue
+                print(f"| {label_of(*k)} | {name} | {tput_cell(row)} | {ms(row['p50_us'])} | {p99_cell(row)} | "
+                      f"{ratio(float(row['throughput']), base and float(base['throughput']))} | "
+                      f"{ratio(float(row['p99_us']), base and float(base['p99_us']))} |")
+    print("\nThe disk arms use BFT-SMaRt 1.2's own log (`log_to_disk`). See docs/DURABILITY.md for what "
+          "that log does and does not guarantee.")
 
 
 def writes_table(data, mixes, equal):
@@ -362,13 +404,22 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tailored")
     ap.add_argument("--indy")
+    ap.add_argument("--tailored-disk")
+    ap.add_argument("--tailored-disk-nosync")
+    ap.add_argument("--durability", help="durable-gate.sh's verdict file for --tailored-disk")
     ap.add_argument("--profile", default="")
     ap.add_argument("--cpus", default="")
     ap.add_argument("--equal-load", action="store_true")
     ap.add_argument("--allow-unreportable", action="store_true",
                     help="print anyway, marked NOT REPORTABLE (pipeline checks)")
     a = ap.parse_args()
-    data = {"tailored": load(a.tailored), "indy": load(a.indy)}
+    data = {"tailored": load(a.tailored), "indy": load(a.indy),
+            "tailored-disk": load(a.tailored_disk), "tailored-disk-nosync": load(a.tailored_disk_nosync)}
+    labels = {"tailored-disk": disk_label(a.durability),
+              "tailored-disk-nosync": "Tailored BFT VDR (unsynced disk log, not recoverable)"}
+    for key in ("tailored-disk", "tailored-disk-nosync"):
+        if data[key]:
+            SYSTEMS.insert(1, (labels[key], key))
     problems = reportability(data)
     if problems and not a.allow_unreportable:
         print("refusing to build a reportable table (--allow-unreportable prints it, marked):",
@@ -400,6 +451,7 @@ def main():
               "within 500 ms; latency percentiles from the merged histogram of all runs at that "
               "load.\n")
     main_table(data, mixes, a.equal_load)
+    disk_table(data, mixes, a.equal_load, labels)
     writes_table(data, mixes, a.equal_load)
     mixed_write_latency(data, mixes, a.equal_load)
     tier0_table(data, mixes, a.equal_load)

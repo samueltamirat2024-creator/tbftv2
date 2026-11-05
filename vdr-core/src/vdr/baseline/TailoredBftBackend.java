@@ -210,6 +210,42 @@ public final class TailoredBftBackend implements Backend {
         }
     }
 
+    @Override public List<String> readLevels() {
+        return List.of("tier0", "tier1", "tier2");
+    }
+
+    @Override public String observe(String did, int replicaHint, String level) {
+        byte[] document = switch (level) {
+            case "tier0" -> issuer.resolveTier0(did, replicaHint);
+            case "tier1" -> issuer.resolveTier1(did, replicaHint);
+            case "tier2" -> issuer.resolveOrdered(did);
+            default -> throw new IllegalArgumentException("unknown read level " + level);
+        };
+        // Tiers 0 and 1 also return null when they fall through with no quorum, which is not evidence
+        // that the DID is gone. Only f+1 "not found" answers on the ordered path are.
+        if (document == null) document = issuer.resolveOrdered(did);
+        return document == null ? null : Crypto.hex(Crypto.sha256(document));
+    }
+
+    @Override public String writeValue(String did, byte[] document) {
+        return Crypto.hex(Crypto.sha256(document));
+    }
+
+    @Override public Boolean observeRevoked(String registryId, String handle, int replicaHint) {
+        return issuer.isRevoked(registryId, handle, replicaHint);
+    }
+
+    @Override public java.util.Map<String, String> stateDigests() {
+        cluster.checkpointEverywhere();
+        java.util.Map<String, String> digests = new java.util.TreeMap<>();
+        for (int i = 0; i < cluster.n(); i++) {
+            vdr.ops.Reply r = cluster.rootOf(i, 5_000);
+            digests.put("replica-" + i, r == null || r.checkpointRoot == null ? "no-answer"
+                    : r.seq + ":" + Crypto.hex(r.checkpointRoot));
+        }
+        return digests;
+    }
+
     @Override public String registryIdFor(String did) {
         return Records.registryIdFor(did);
     }

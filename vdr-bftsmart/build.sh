@@ -87,7 +87,7 @@ case "${1:-}" in
       -Dlogback.configurationFile="$(cd "$CONFIG" && pwd)/logback.xml" \
       -Dvdr.replication=bftsmart \
       -Dvdr.bftsmart.config="$CONFIG" \
-      vdr.bench.Bench "${2:-4}"
+      "${VDR_BENCH_MAIN:-vdr.bench.Bench}" "${2:-4}"
     ;;
   realgates)
     refuse_if_stubbed
@@ -97,6 +97,7 @@ case "${1:-}" in
       -Dvdr.bftsmart.proxies="${VDR_GATES_PROXIES:-8}" \
       -Dvdr.clientIdBase="${VDR_CLIENT_ID_BASE:-1001}" \
       -Dvdr.gates.byzantine="${VDR_GATES_BYZANTINE:-}" \
+      -Dvdr.gates.ackFile="${VDR_GATES_ACK_FILE:-acks.txt}" \
       vdr.replication.bftsmart.RealGates "$@"
     ;;
   gates)

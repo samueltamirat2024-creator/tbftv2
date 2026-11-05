@@ -39,6 +39,8 @@ import java.util.concurrent.TimeUnit;
  *   m6-forge                      replica 2 runs FORGE_DOC
  *   m6-stale                      replica 1 runs STALE_READ
  *   m6-suppress [rounds]          replica 3 runs the behaviour real-gates.sh started it with
+ *   durable-load [ops]            ordered writes, each logged to -Dvdr.gates.ackFile once f+1 acked
+ *   durable-verify                every replica was killed and restarted: nothing acked may be lost
  * </pre>
  */
 public final class RealGates {
@@ -65,6 +67,8 @@ public final class RealGates {
             case "m6-forge" -> m6Forge(base);
             case "m6-stale" -> m6Stale(base);
             case "m6-suppress" -> m6Suppress(base, arg > 0 ? arg : 25);
+            case "durable-load" -> durableLoad(base, arg > 0 ? arg : 5_000);
+            case "durable-verify" -> durableVerify(base);
             default -> usage();
         }
         System.out.printf("phase %s: passed %d, failed %d%n", phase, passed, failed);
@@ -161,6 +165,120 @@ public final class RealGates {
                         + "rounds of traffic%n", roots.get(0).seq, round[0]);
             }
         });
+    }
+
+    // ---------------------------------------------------------------- durability
+
+    private static final String ACK_FILE = System.getProperty("vdr.gates.ackFile", "acks.txt");
+
+    /**
+     * Registers, updates and revokes, appending one line to the ack file only once f+1 replicas have
+     * acknowledged the write. deploy/vps/durable-gate.sh kills all replicas with SIGKILL while this
+     * runs, so the file is exactly the set of writes that a client was told are committed. Every
+     * write is sent on its own, so the load crosses checkpoint_period and recovery has to use both
+     * the stored checkpoint and the log after it.
+     */
+    private static void durableLoad(int base, int ops) {
+        gate("D", "Load with every acknowledged write recorded (" + ops + " ops)", () -> {
+            try (BftSmartCluster c = open(base, all());
+                 java.io.PrintWriter acks = new java.io.PrintWriter(
+                         new java.io.FileWriter(ACK_FILE, StandardCharsets.UTF_8, true), true)) {
+                VdrClient alice = client(c, "durable-" + base);
+                String run = Long.toString(System.currentTimeMillis(), 36);
+                int acked = 0;
+                for (int i = 0; i < ops; i++) {
+                    String did = "did:vdr:durable-" + run + "-" + (i / 10);
+                    byte[] document = doc("durable-" + run + "-" + i);
+                    VdrClient.Outcome o;
+                    try {
+                        if (i % 50 == 49) {
+                            String registry = Records.registryIdFor(did), h = handle(i);
+                            o = alice.revoke(registry, List.of(h), null);
+                            if (o.ok()) acks.printf("REV %s %s%n", registry, h);
+                        } else {
+                            o = i % 10 == 0 ? alice.register(did, document)
+                                    : alice.update(did, version(alice, did), document, alice.publicKey());
+                            if (o.ok()) {
+                                versions.put(did, o.version());
+                                acks.printf("DID %s %s %d%n", did, Crypto.hex(Crypto.sha256(document)), o.version());
+                            }
+                        }
+                    } catch (RuntimeException e) {
+                        System.out.printf("        write %d did not complete: %s%n", i, e);
+                        break;      // the expected end of this phase: the replicas were killed
+                    }
+                    if (o.ok()) acked++;
+                }
+                System.out.printf("        %d of %d writes acknowledged%n", acked, ops);
+                check(acked > 0, "no write was acknowledged, so a later verify would prove nothing");
+            } catch (java.io.IOException e) {
+                throw new java.io.UncheckedIOException(e);
+            }
+        });
+    }
+
+    private static final Map<String, Long> versions = new TreeMap<>();
+
+    private static long version(VdrClient client, String did) {
+        return versions.getOrDefault(did, 1L);
+    }
+
+    /** Fresh JVM against restarted replicas: every line in the ack file must still be true. */
+    private static void durableVerify(int base) {
+        gate("D", "After killing every replica, is every acknowledged write still there?", () -> {
+            try (BftSmartCluster c = open(base, all())) {
+                VdrClient reader = client(c, "durable-verify-" + base);
+                Map<String, String> latest = new TreeMap<>();
+                Map<String, Long> latestVersion = new TreeMap<>();
+                List<String[]> revocations = new ArrayList<>();
+                for (String line : java.nio.file.Files.readAllLines(java.nio.file.Path.of(ACK_FILE))) {
+                    String[] f = line.split(" ");
+                    if (f[0].equals("REV")) {
+                        revocations.add(f);
+                    } else if (Long.parseLong(f[3]) >= latestVersion.getOrDefault(f[1], 0L)) {
+                        latest.put(f[1], f[2]);
+                        latestVersion.put(f[1], Long.parseLong(f[3]));
+                    }
+                }
+                check(!latest.isEmpty(), "the ack file is empty, so a pass would be vacuous");
+                int lost = 0, revokedLost = 0;
+                String firstLost = "";
+                for (Map.Entry<String, String> e : latest.entrySet()) {
+                    byte[] got = reader.resolveTier2(e.getKey());
+                    if (got == null || !Crypto.hex(Crypto.sha256(got)).equals(e.getValue())) {
+                        if (lost++ == 0) firstLost = e.getKey() + " (acked version "
+                                + latestVersion.get(e.getKey()) + ")";
+                    }
+                }
+                for (String[] r : revocations) {
+                    // Tier 1 fails closed, so "revoked" alone proves nothing here: ask for the entry.
+                    Reply proof = revocationEntry(c, r[1], r[2]);
+                    if (proof == null || !proof.revoked) revokedLost++;
+                }
+                System.out.printf("        %d DIDs checked at their last acked version, %d lost; "
+                        + "%d revocations checked, %d lost%s%n", latest.size(), lost,
+                        revocations.size(), revokedLost, lost > 0 ? "; first lost: " + firstLost : "");
+                check(lost == 0, lost + " acknowledged DID writes were lost");
+                check(revokedLost == 0, revokedLost + " acknowledged revocations were lost");
+                check(reader.register("did:vdr:after-restart-" + base, doc("after-restart")).ok(),
+                        "a new write did not commit after the restart");
+                c.checkpointEverywhere();
+                Map<Integer, Reply> roots = converge(c, all(), CONVERGE_MS, () -> {
+                    load(c, "durable-converge", 20, 1);
+                    c.checkpointEverywhere();
+                });
+                assertAllEqual(roots);
+            } catch (java.io.IOException e) {
+                throw new java.io.UncheckedIOException(e);
+            }
+        });
+    }
+
+    private static Reply revocationEntry(BftSmartCluster c, String registry, String handle) {
+        for (Reply r : c.revocationTier1(registry, handle, 0)) {
+            if (r.ok && r.revoked) return r;
+        }
+        return null;
     }
 
     // ------------------------------------------------------------------------ M4

@@ -161,13 +161,27 @@ public final class VdrClient {
 
     /** Tier 2: ordered read through consensus, DepSpace's fallback path. */
     public byte[] resolveTier2(String did) {
+        try {
+            return resolveOrdered(did);
+        } catch (NoQuorum e) {
+            return null;
+        }
+    }
+
+    /** An ordered read with no f+1 agreement: unlike "not found", this says nothing about the DID. */
+    public static final class NoQuorum extends RuntimeException {
+        public NoQuorum(String m) { super(m); }
+    }
+
+    /** {@link #resolveTier2}, but null means f+1 replicas said "not found", and nothing else. */
+    public byte[] resolveOrdered(String did) {
         List<Reply> replies = cluster.invokeOrderedSync(Op.resolve(clientId, did));
         Map<String, List<Reply>> byDigest = new TreeMap<>();
         for (Reply r : replies) byDigest.computeIfAbsent(r.digest(), k -> new ArrayList<>()).add(r);
         for (List<Reply> g : byDigest.values()) {
             if (g.size() >= cluster.f() + 1) return g.get(0).ok ? g.get(0).value : null;
         }
-        return null;
+        throw new NoQuorum("ordered read of " + did + ": no f+1 agreement in " + replies.size() + " replies");
     }
 
     /**

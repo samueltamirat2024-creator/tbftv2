@@ -75,7 +75,9 @@ Detach with `Ctrl-b d`, re-attach with `tmux attach -t bench`.
 | `full` | 60 s / 60 s | 60 s / 60 s | 10 | the paper's stated protocol |
 
 Other knobs:
-- `SYSTEMS=tailored` or `SYSTEMS=indy`: one system only.
+- `SYSTEMS="tailored tailored-disk indy"` is the default. Name a subset to run fewer arms, and keep `indy`
+  last: `STATS.md` compares each arm against the last one named. `tailored-disk` logs with
+  `sync_log=true`; `tailored-disk-nosync` does not sync. See "The disk arm" below.
 - `MIXES="register update"`: a subset of `read-heavy bursty-revoke register update`.
 - `TAILORED_LEVELS=...`, `INDY_LEVELS=...`: comma-separated sweep levels for the mixed workloads.
 - `TAILORED_WRITE_LEVELS=...`, `INDY_WRITE_LEVELS=...`: sweep levels for `register` and `update`.
@@ -92,6 +94,23 @@ marked SATURATED measures a queue.
 MIXES="register update" ./measure-table.sh                # each system at its own knee
 EQUAL_LOAD=1 MIXES="register update" ./measure-table.sh   # both systems at the same loads
 ```
+
+Set the levels from measured data with `EQ_FROM=results/table/<stamp>`: it uses about 50% and 80% of the
+Indy operating points in that table, and refuses if a mix is missing. For a reportable equal-load table:
+
+```bash
+PROFILE=full EQUAL_LOAD=1 EQ_FROM=results/table/<own-operating-point stamp> ./measure-table.sh
+```
+
+**The disk arm.** Indy keeps its ledger on disk, and the Tailored BFT VDR logs in memory. `tailored-disk`
+removes that difference. Before measuring it, the script runs `durable-gate.sh`, which kills all four replicas
+with SIGKILL and checks every acknowledged write. On BFT-SMaRt 1.2 **expect FAIL** (`docs/DURABILITY.md`), and the
+arm is then named "sync disk log, not recoverable" in every table. It still measures the cost of synchronous
+logging; it does not support any claim of crash recovery. Run `./indy-fsync-probe.sh` during a register load on
+Indy: if Indy does not sync per commit, `sync_log=true` is stricter than Indy, so also measure
+`tailored-disk-nosync` and report both.
+
+**Fault injection.** See `faults/README.md`.
 
 ## 4. What the script does
 

@@ -60,6 +60,46 @@ public interface Backend extends AutoCloseable {
      */
     void resolve(String did, int replicaHint) throws Exception;
 
+    // ---- Fault-campaign reads (vdr.bench.History only). resolve() above stays the measured path: it
+    // discards what it read, so no measured operation pays to decode or compare a value.
+
+    /** The read paths {@link #observe} accepts, strongest last. */
+    default List<String> readLevels() {
+        throw new UnsupportedOperationException(name() + " has no history reads");
+    }
+
+    /**
+     * What a read returned, in the form {@link #writeValue} predicts. Null means the DID was not found.
+     *
+     * @param level one of {@link #readLevels}
+     */
+    default String observe(String did, int replicaHint, String level) throws Exception {
+        throw new UnsupportedOperationException(name() + " has no history reads");
+    }
+
+    /**
+     * The value {@link #observe} will return once this update applies. Known before the write is sent,
+     * because a write that times out may still take effect and the checker has to recognise it.
+     */
+    default String writeValue(String did, byte[] document) {
+        throw new UnsupportedOperationException(name() + " has no history reads");
+    }
+
+    /** Whether this handle reads as revoked, or null if this system cannot say per handle. */
+    default Boolean observeRevoked(String registryId, String credentialHandle, int replicaHint) {
+        return null;
+    }
+
+    /** Revoked entries in the registry as the system reports them, or -1 if it cannot count them. */
+    default long observeRevokedCount() {
+        return -1;
+    }
+
+    /** Each replica's state digest after healing, or an empty map if the client cannot ask. */
+    default java.util.Map<String, String> stateDigests() {
+        return java.util.Map.of();
+    }
+
     /** The revocation registry a DID's credentials belong to. */
     String registryIdFor(String did);
 

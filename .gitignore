@@ -5,6 +5,7 @@ target/
 .vscode/
 .DS_Store
 deploy/vps/results/
+deploy/vps/.arm-config/
 *.env
 *.pem
 *.key
